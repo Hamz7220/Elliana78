@@ -1,0 +1,1236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Elliana</title>
+<link rel="icon" type="image/png" href="logo.png">
+<link rel="apple-touch-icon" href="logo.png">
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#111111">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+<div id="app"></div>
+<div class="modal-bg" id="modal"></div>
+<div class="toast" id="toast"></div>
+<!-- Supabase cloud sync (optional). Loads the client, then our config. -->
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2/dist/umd/supabase.min.js"></script>
+<script src="supabase-config.js"></script>
+<script>
+/* ============================================================
+   Elliana The Shop — Clothing Store Management System
+   Self-contained app. Starts empty; your data persists in the browser (localStorage).
+   ============================================================ */
+
+const DB_KEY = 'elliana_db_v3';
+const SESSION_KEY = 'threadline_session_v1';
+const REMEMBER_KEY = 'threadline_remember_v1';
+
+/* ---------- Seed data ---------- */
+function seedDB(){
+  return {
+    users:[
+      {id:'u1', name:'Store Owner',  username:'admin', password:'admin123', role:'admin'}
+    ],
+    products:[],
+    sales:[],
+    nextSale:1001
+  };
+}
+
+/* ---------- Persistence ---------- */
+let DB;
+function loadDB(){
+  try{ const raw = localStorage.getItem(DB_KEY); DB = raw ? JSON.parse(raw) : seedDB(); }
+  catch(e){ DB = seedDB(); }
+  if(!DB.settings) DB.settings = { alertEmail:'', ccEmail:'', storeName:'Elliana The Shop', autoAlertOnLogin:true };
+  if(DB.settings.storeName==='ThreadLine Store') DB.settings.storeName='Elliana The Shop';
+}
+function saveDB(){ try{ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }catch(e){} if(window.Cloud && Cloud.ready && !cloudApplying){ Cloud.saveState(DB); } }
+/* set true while applying a remote update, so we don't echo it back */
+let cloudApplying = false;
+/* resilient key/value: localStorage first, cookie fallback when storage is blocked */
+function ssGet(k){ try{ const v=localStorage.getItem(k); if(v!==null) return v; }catch(e){} try{ const m=document.cookie.match('(?:^|; )'+k+'=([^;]*)'); return m?decodeURIComponent(m[1]):null; }catch(e){} return null; }
+function ssSet(k,v){ let ok=false; try{ localStorage.setItem(k,v); ok=true; }catch(e){} try{ document.cookie=k+'='+encodeURIComponent(v)+';path=/;max-age=31536000;samesite=lax'; }catch(e){} return ok; }
+function ssDel(k){ try{ localStorage.removeItem(k); }catch(e){} try{ document.cookie=k+'=;path=/;max-age=0;samesite=lax'; }catch(e){} }
+function saveSession(remember){
+  if(remember){ ssSet(SESSION_KEY, session.id); try{ sessionStorage.removeItem(SESSION_KEY); }catch(e){} }
+  else { try{ sessionStorage.setItem(SESSION_KEY, session.id); }catch(e){} ssDel(SESSION_KEY); }
+}
+function clearSession(){ ssDel(SESSION_KEY); try{ sessionStorage.removeItem(SESSION_KEY); }catch(e){} }
+
+/* ---------- Session ---------- */
+let session = null;   // {id,name,role,...}
+let activeView = '';
+let cart = {};        // productId -> qty  (POS)
+
+/* ---------- Helpers ---------- */
+const $ = s => document.querySelector(s);
+const app = $('#app');
+const money = n => 'MK' + Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+const esc = s => String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+function fmtDate(ts){ const d=new Date(ts); return d.toLocaleDateString(undefined,{month:'short',day:'numeric'}) + ' ' + d.toLocaleTimeString(undefined,{hour:'2-digit',minute:'2-digit'}); }
+function stockBadge(p){ if(p.stock<=0) return '<span class="badge out">Out of stock</span>'; if(p.stock<=p.reorder) return '<span class="badge low">Low · '+p.stock+'</span>'; return '<span class="badge ok">'+p.stock+' in stock</span>'; }
+/* ---------- Theme ---------- */
+const THEME_KEY='threadline_theme';
+let theme = (()=>{ try{ return localStorage.getItem(THEME_KEY)||'light'; }catch(e){ return 'light'; } })();
+function applyTheme(){ document.documentElement.setAttribute('data-theme', theme==='dark'?'dark':'light'); }
+function toggleTheme(){ theme = theme==='dark'?'light':'dark'; try{ localStorage.setItem(THEME_KEY,theme); }catch(e){} applyTheme(); if(session) renderApp(); else renderLogin(); }
+const themeIcon = ()=> theme==='dark'?'☀️':'🌙';
+const SUN_SVG='<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round"><circle cx="12" cy="12" r="4.2" fill="currentColor" stroke="none"/><line x1="12" y1="2" x2="12" y2="4.5"/><line x1="12" y1="19.5" x2="12" y2="22"/><line x1="2" y1="12" x2="4.5" y2="12"/><line x1="19.5" y1="12" x2="22" y2="12"/><line x1="4.9" y1="4.9" x2="6.7" y2="6.7"/><line x1="17.3" y1="17.3" x2="19.1" y2="19.1"/><line x1="4.9" y1="19.1" x2="6.7" y2="17.3"/><line x1="17.3" y1="6.7" x2="19.1" y2="4.9"/></svg>';
+const MOON_SVG='<svg viewBox="0 0 24 24" fill="currentColor"><path d="M21 12.8A8.5 8.5 0 1 1 11.2 3a6.8 6.8 0 0 0 9.8 9.8z"/></svg>';
+const SVG_ATTR='width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"';
+const IC_USER=`<svg ${SVG_ATTR}><path d="M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8Z"/><path d="M4 20a8 8 0 0 1 16 0"/></svg>`;
+const IC_LOCK=`<svg ${SVG_ATTR}><rect x="5" y="11" width="14" height="9" rx="2"/><path d="M8 11V8a4 4 0 0 1 8 0v3"/><circle cx="12" cy="15.5" r="1.2" fill="currentColor" stroke="none"/></svg>`;
+const IC_EYE=`<svg ${SVG_ATTR}><path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7-10-7-10-7Z"/><circle cx="12" cy="12" r="3"/></svg>`;
+const IC_EYEOFF=`<svg ${SVG_ATTR}><path d="M3 3l18 18"/><path d="M10.6 6.1A9.8 9.8 0 0 1 12 6c6.5 0 10 6 10 6a16 16 0 0 1-3 3.6"/><path d="M6.3 7.3A15.9 15.9 0 0 0 2 12s3.5 6 10 6a9.6 9.6 0 0 0 3.4-.6"/><path d="M9.5 10.5a3 3 0 0 0 4 4"/></svg>`;
+const IC_LOGIN=`<svg ${SVG_ATTR}><path d="M14 4h4a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2h-4"/><path d="M10 16l4-4-4-4"/><path d="M14 12H3"/></svg>`;
+const IC_ADMIN=`<svg ${SVG_ATTR}><path d="M12 3l7 3v5c0 4.5-3 8.3-7 10-4-1.7-7-5.5-7-10V6l7-3Z"/><path d="m9 12 2 2 4-4"/></svg>`;
+const IC_BAG=`<svg ${SVG_ATTR}><path d="M3 7h18l-1.5 12a2 2 0 0 1-2 1.8H6.5a2 2 0 0 1-2-1.8L3 7Z"/><path d="M8 7V5.5a4 4 0 0 1 8 0V7"/></svg>`;
+function themeSwitch(id){ return `<button class="theme-switch" id="${id}" role="switch" aria-label="Toggle dark mode" title="Toggle dark / light mode"><span class="ti ti-sun">${SUN_SVG}</span><span class="ti ti-moon">${MOON_SVG}</span></button>`; }
+applyTheme();
+
+let toastTimer;
+function toast(msg){ const t=$('#toast'); t.textContent=msg; t.classList.add('show'); clearTimeout(toastTimer); toastTimer=setTimeout(()=>t.classList.remove('show'),2200); }
+
+/* ============================================================
+   LOGIN
+   ============================================================ */
+let rememberMe = (function(){ try{ const v=localStorage.getItem(REMEMBER_KEY); return v===null ? true : v==='1'; }catch(e){ return true; } })();
+const LOGO_FULL='logo.png';
+const LOGO_ICON='data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAKAAAACgCAYAAACLz2ctAAA+fElEQVR42u29d3wdV5k+/rznzNyme9WbZbnLcpFl2XF6dSAJhBBqrGVDSeiBkA27C/z4svtdyVtYyjdLCwsJJCwtAYlASAIsEGKnJ46brOJe1Hu7/d6Zc97fHzNXko1DEseBBM/z+diSrkb3zpx55n3f81bAgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48ODBgwcPHjx48PByQd4SvDQwMwGtAgDQCrSiFZs2rWa0dhE2bXKP2qSJiL3V8nD6iNfSIltaNskXfXxTk2BukQ5hPXgS8NQlngARE8DuzxFgagPSAytT0bEiK5MKk2a/4QtMB4sqxhEo2weU7iSiqdx7tLS0yMbGRuWtpkfAl6hqm4los3Z+HrsiPdR59eTAkbfGpvqXhZCElZyGVilAA0L4YYaLkNRBFJRUHQsVz98WWVD7c8glvyKieFMTRHMzs6eaPQK+KPLliMKcvDDW+9hnR4+2X6vHDyAz0Q+VjrKkrDKEAEEDIAITaw0oMiUF8kiGShGpWo1A5ZpdxbVn/zNR1a+d92sSOVJ78Ah4UpVLRJqZDSTavzTQ+dhNsWPPBRNjRzkobO2TRIKYBOBqZWIQACYCAAYYBLY1OG2BEZ5nhJecrxc3XPEt5Dd8mohS3NIiyVPJHgGfT/Ixc0mib+tdk/v/8NaxQ08jRGklBSSBQSAws7Jshg0hNUkQAGINg5RtCiIhSYIZIAEbpGOWgaIl54iSVa97OLLwDe8josG5UvZMhuHRbo7NRwRmDkV7H75nZPeDVyX7dtr5fiGhWYIItpY6ZQkKFJTLQOE8ZCgE6cvTtrJAKi38lDZSk4NIT49ynqG0SZAmK1FkEmJHn7HT8ckrKqzMQ8z8FiLq90joEXDOhqNVCBIq2vfo7WPtv7kqM7jHjvjJUCoLIX1IZKEoXC3DNQ0oqV75eF7pgl+bReXbgUgMYA1MlWfHhs+NTvZvzIz3XBrv3SWnx47psEkktE0Rv2nER/fbY3vkWVL6v8/M17S2NtrMfEb7DD0VDMfHR42Nyo513Ty08/7bx7t+Z+f72dDKBgsT02mhi5efL8KLz3u2dPnGzUD+74hIPa/bBpPXRI9t+8fp7p2XjR54AmFKsWSLpDCQyMIK11xklq176xfzys/9bM7m9CSgt+lYPLDj7n8dO/ikzvdDsNIADMQsH+evuFQsPv9tX0Ve3f8horTzd1sMtI4yNm1ypVcrAWVERDaAB5n5ofwFNR+GP/+L410PF4bsKZZaUZ5fGmOHntWUV3Yrc+LnRLTtTPYTeioYzSAiTow88/+lh9uKAxxXpLUEScQtocJLL5Q1F2/6FAVW3OYSVgLQLtGeV527Uu1O5qluBt833v6/IUEJNpWmfGnrdP+ewPiRR/+JhHhrZ2fnGauCDU/6kWbmRd3Pfvs98aGDnC9JgAlpi3Xe/AY5r+Gq/6HAittaWjbJTZta9POp3hmbxrHnFDMTduwwiQp/y9mDzZye/nJ03x+UYQhpEsTUWDfLYx1v0kqtJaI9Z6oqPsMlYCsBgDW1+x08fSTsVwklJEnNpNnMF/7KNYeCFRf8HTMIaHlJUQz3WItbNkmYNf8VqV57dWr4wOuy0W5lEMug0Ipi3Ua894nrAezZurVZAPAIeCbtfF3pFxg7eP+70+M98EsiECNrM4cWrET50nXfJ6IYM8sXknzPi02b4HxO/3en+9ovj072UL7JMCUoPTWAqdHua5j534gocSa6ZcQZLP4ITiijKjHev9qOT8Jw7j7bwi85Up00S866h5mpuRkvgxSN2rELqx7wF1QfNf35AgwtQcJKRKGSY2sArDhTvRJnLgFbW92bPVGZmRozJSyANZjBZqgIeUXznhLSOEJEvHnzqdtmRODW1kZBRIm8/NKtZl4hlAIzCUhoZGMTDLun+Ey9DWeyBHShDMtKkUsWKMU6UFChI0Xlu1krvJQcwOfVwo6oJcMfOCT9ebAZADMEMbOdJjueLJhrk3oEPBMw478rG/bnlYtklnVWkx3NaI1wtQiULtrpHNZyOj7MyVwQptJsIKfQiQCCBpE+Y+/DGbsJcTYGIAAHS5et/3bIzx9LT/aL8nApzPLVD8C3uNXdFJwWBzEzKNZr+aCyIMFgMDQTmCRkwEg6AtAj4BlJRBLy4zpx5Ofp2NjCQF7RGEJLfkNE9mlLp+/sZGoEjx9InKOtGKSTsQUGkTBDgD88fbxU9gh4hpDPTbPXChRc9PAJv8PpcIm4JGZubi7sfva7G+zUNIJCEMBQMGDklSigasw5utmTgGciXEfzHDvsdFa1tQqiRsWZQ2+3p3vn63RMCZOlAit/pFDKUNEzAA45LpjNngQ8cyXh6U8GYGZCayOYOW98/89vTg/vR9AgYtawFMFfUI3SqmUPEJG9ZcsWg+hy29sFezhtrAa2SmpsVXa07XPTPTs2cHRIm8SCiDitAwIFS+xg5Xk/B4CNGzeekSlZHgFfAanH3CL5X1gQXW4zj2wa7Hz0M9OHn1V5fk0MhYzSKr9qGZUsXvtTAIedQqUzMyfQU8GnS9WiVaAVcN02iqQBtvd/qPeZ1m+P731EFvgsLVgTSHJGB0S4qiGVv3Djl9waFAI2wyOgh5dMvOZmIld6Kfe1AJA6O9n/5Oe6H//x1eP7n0JEJlmSEkQScRt2Sc15Ztny875wJqdheQQ8DeRzd8rMzCXAVH1y7NCVY3vvuzY2dLA+O3YAmfGjusjHRNomIomULaxAZb0ZWnrJ782i9f/Z1NQkAHhFSR5OjXzMXJ4c2Pqlnqe/eSlnppbY0RFkJvuhkhMISEtFDJIEAEJyNAMdrF5rltS98bGCxVe+h4gs1/Y7ownoFSWdkr0HAJCjh37169i+h6+MD+wF7LgOSM0mGUSCCcwEIZBVbKcpzyhcdh7yl110T+Giqz5ORNNeSaYnAU/Zc0BEipP73hk7su3K5LHtdkGQBAsWcIIeUBpaaaEzyieCFcuM4nnrp6rrLvoiFa7/ArTCmW73eQR8OdjaTAAQHep9C8X6OWhqsK0FE8GGgUwWTKEi4S9ZiHDRMq5cvv7+4LzL/pWIds1pUOSRzyPgqaF562YNEKx0LMJ2kpgcVas0wfKXIH/52RQoWdhVULnsSX/5OXcS+bYDsy3aNm/2rB6PgKds/4GcsB3Bsm2f1jYcM04gk1WqfM35suzC994GVDUTUTz3N8DpS+v6q7NnvCU4dT46DbIIzJo1mSJumwxEfklE8Y6OFp9j68FTuZ4EPN2SUNFQeyuY2WkLQxIkBWUtlQQi0057Diic4T4+TwKeRtXLzIStWyRv2SJJGMxaGcS2k3MAQGhAOF6tLBFpIlJExNwEwVu2GE6/6Cbh9Yz2JOBLIB4LbN0qnDQpAgDbfb10bF/rYiuThp8EgUBa2zov4g8Aqbcw8xiAFIAUEWlsvnyOCt4MbmmR2AR43fQ9R/TzEK9Fghp1rjG5MHxQVmYRMFyTHD36emGnL5vubbtwZMf9yDMyIAAZi2BWr0P+knOQTHMfCTEppG8qLy/SlxcpPeorqn4S/uqDAHpzDY5yn0V05nZL9Qh4osQD8UyqPvNaK7rryomBI1ekJoYvzUz0hUw1jUx0HNn4OIIyDQkbzuESWW0gbROkLwApTQjThC+YBzOQjxQHESianzEKqg4VVyz8TaBi3UNA8CkisgAQcxOdib2jPQLCaRwOALMd8bMXpIae+vuRwzuvVVNHA+nJAWSiEzB1FlLYtiQiIYRkKEhy8gkot5QkwCAmBmvWrEmz1oysLQxFPkh/PsIl1RDFi3XJkobnwgvXfYHk/PudCMmZ18CcznCJR3BDa+7P9db4k58e2vvsu5L9bWZy9BgCMm0bQpAkEk6DaA3NxACx1po1A8yAZsAJxQkQAQIMEoBhEEiAtGYiEMDMWVvrlDINf9F8FCxaj/IVF/7GV3HJh4ho4EwL09GZSzynWMj9uSI7seNz08d2fGDq6HPh2MB+5BmWMiSEyyoAgi3NbNustfAZRiAPpj8CIxCBMEMQZgCCDLBmaG1D2ylY6SjsTAxWMgqyk8rnE06qAhhSSLYVOJYFRxbUy/K1V7cXLL32GiLqPZMkoXFmEs/JWmbmCDL7Pzjc9v1/iPXuWBDt7UQepVVBgAVrLcECIAmboVOWEEakgkLlNcI2i6eKyqv6jFD+ftMX6vAHwxOm6YtDGBpgBdv2Z6xkJJlMLLSTsXMSU8MrODlUmh4+hNjkIAf9BGJNEpoKgxLJ/nZrhLkewv9DZr4KgMXcfEZkyxhnBvFAAM8lXhAYbJzc1/rpqZ4dddHeNpjZKZUvpSCwZM0gTYCQSNlSq1CZCC1pQFHVqkfKFq+4H+H6R0xfsNO20i9KyTDrxUjvv3qyd3/jdH/nxolDz8LMTqqgISTZWYT9pjnV126P5827rKCq5jryL7uHuUXCzbL2CPhXQTxSzBwC+t8X737woxNHd62bOroTlBhReT4iYQgJ1iC4XSKFiVgWbFbViUUNb2wrrLnkn8moeAjKmnn/XOOiTdjkdCCaC3eSZmdjKxPRMQDfYuZvFy0//735lcs/P9zxh/mJoS4VMqXU2SzCfoNSgx08vG/Hh0DinubmxjPCP0h/ncT7IxuPgP73pXp33zp5ZNf68WM7oeJDOmwKSGLBrDA7+MhZlrSCNuc1iPkXXP+7UMUl7yKiSQYI3CKATS8pvuvssuuIqFE7p8O1iYEt3+999r7zE71tnO9TJAVxGnlkLrt6Yvnr/34DER2buyFhZoHWVvprm7Bk/HUSb0bV+oCe6+NHH/rQxLG2i2I9O2FHB3WeX8DwkWDWYM0gx3Xi9mthgATbSouCsuU6VHHJPxPRJG/fbtLZZ1s4Bafx3A0Fb9liENEBZn77/PWpxw5Hx5ZbqQE2oIislB3Q0WJE970OwN1zBcRcwjvq+a8jimL8lRIvDOvQ+8f3/+yDif6uhnh/B6ypfp1nAnkBIVgrMOSMDuA5t5HYGT8oyEAmo7MARpiZ0Nx8WiQPXX657ZJwiJnfUzJ45PGh7T83/T5mSRoqPoz4RP9iAOhsbZUAVHf7o1eVlISuzptX2yLNsqdnJftrn4jGa5x4jlqaS7z03htH2++5KTG0ty420A4dG9ZBgxDwQ0BrsBawmXQmq2GahjCFdq0+nrttgJQCcN434RYgAZtPT+0uXX657YTgaFty5KkfJ3rb3p8Z7dIBQaQzMaRTifnOkZ0AgJICc128r+2TPXv+8PGxvT97rGhJ/T2Qi1tncw5fu0Q0XqvE27q1WeRmdTBzNeKdjUNt93wwNdy1Ot7XDk6OqaCPSZoQzuZCsiLS8SwJEa4U81bXIdp/ENmpXgSEG3tzFLDTPJoZUtAraCc7rdiCZRfcEah88obx4f0iaLJtW2lonS0CgPTSQQaAvOIwTe7rsZMHnxZjk51XJPo7rjCLl36Wk113ILjqe0Q0CQBbtjQZGzc269eSI9t4zUk8Z7CMBqCZuQbJjvcO7PrBB7Mje+fHB7qgUxM6ZALCD8lagyDY0qRTypC+gvmyYNkKhKvqt5ctrxuM//Y716rxPobMdWojJ8cPbnBNGK/kRi0nrTojlbVtsYMl67UaZ9YKBA4DAHbMyEwtTBhhI2PJRK+a7OyGzCutzQ513WYUL7+JE13/jdCqHxPRKLDZ3fQ047VAROO1QzziOTvCBntq24cHd971rvRQR8l0/17ITEwFfUTC1MK5s4KVJhXXfiNQslBGylaogur635asOPubwLwtyPS+kWTo2rk6izW5+X0CgIA0TAaQeUXcD0TMLZskEcUzI0//Ib+kal2yf5SNgHDYDwAb3IOFYEFSMyuQVjJsApwd1dEDWxjBtuXWaOdXzLLaW+2J7XfKog2/JKIut9UH5cZReAQ8ReIR5YhHYE5cnBnd+aH+bXe8KzO8xx/t3wfDTqiI3yDyQ4IVmAVnFXQGARkuW2IUla3MFC1uuC+y6LxvERU8kRM8bHUrCEIuo5SZAKHBTCAICGEAhhEHYL1iF1j2cQJa4SsobVdmGFlb20KDoF1bLicBZWAgSyERtQQXCa0MCSm0EmE/oPSYjh15nLm3bXGqv+3zRsVz/zcx8PhPQ/POu4vI/wQRcc599GpM+zJencRrkc3NjXOJd1l6aNvNvc/c9U5ruFNM9++HDwkVMaQQJklmBQ3Jlk06Q0FZULVCBkpW2GWLG34Urr7s60S0y9V5BO4wgToL6CGGdjUswQk6EIgIgGZpBggQxwCkXzGX6datjmTy1TyZEKV23sINoUhxOdJaDgHAkaJJd8YIHvRVrPl+xXq6IdW/C/GJXoSErXxCCNJKhAwCUUyn+7ZzfKArqAf33GiU7bgx0fvwQ6HqS75M5H/MdR8Rt7SIV5Mv0Xi1EQ/UqGfdDNnzk4NP/333k3c02sMdiA4dRICyqtAUAuwSjySnLdaWDMnI/FqZV7EmVbJo7V158y68k4jaAcCpx20hokbF6FJEa5ito8TKdmlJxxGMmVj4Q5C+4CCR1I7GPP31HbR5s3Yq7ehwrG/b+3wGr4chMR3HTwGgs3M1NzYSA4gBdCPz2E+me+o/MXpkz5vU2F45NXYMfp1RAVMKYiUCBiMg0mwN7dHRgX3SGtzzZlm2483J3ofvD1Zf+HUSeVuosVFxU5NAcx29GnbO9Jcn3fFRC+e15AWpwWc/PXZk55szw3vN2NAhBCmt/D4hSTPAABN0KqvZMvNlZP5q+Crrp8sXrv2ur+yc7xDRfgBwFrr5j5y4RI3Kjnfc2P3Id7+X7t2uQ6aYjYaAYCu2/ZV1RvH6d94RWXLVTX/p7BTXjnP3RhKsU+clB5/+6Hhv5yZ7dG842r8fhhVXIZ8UxNp5VoSEZWuVUEKGK5bBLF/DZUvXPxCsvuSLRL6nXy1ObeMvT7wZH54AJi+Jd2//x+5Hb7/aGtlrxEePIigyqtBHAhqSNYMhdDKrWfsKZP7SOvgqVg9V1a7/PsLrvzdDvJYWiU1uuOxE393WMgKATDK6QqgkDCjH9+JO7iICbA0y/MUIFlU5jjhsFMArS0DmFokdkwLYAGzYoOY+NDlyuA+PJvI9C+BZZv6Sntr+3rGezg8l+9rLo717Ie2YCvmISNvCEFoWSsAaP6jGR47K7HDXW33lO6+ZOvirBwtqzr0dKH1qdv7xX4aIxquAeCFg7Irosd/cMnF09xXpkS6kx3qQJyxVaJJgZklMsFnolEWgULHIX7wGonhFb3Xtum8h0nCvG+x3idfJf8rYbt56uQYRslNja1VyGlIc74LWkKyEIXWwNCML6h5yWfuKSz/3nNWLOMbxCjiSfR+Af2Lm72B517uH9m+/KTOytzrW0wFhTdhBnxRgFoZgWWTYbE/u15OjR4zMYMfbx47sfHvhwjVtnDlyG3xLfvGXcmobf0Hi5QE97xw7cP9npnrb67LDe2FN9iJoKFXgJ0HaiZUphk5nGUZ+lcifVwd/Re2BymUN30femruJaOgEiaf+9Dk0CaCZm5uxuPvZO85ORSeQJ6SYdcsRtGbty68QRVXLfg+gu6kJr7rk0LkJCq5D/hiA/2Dmu5Hqev/A3u0fs0e6qqN9HUBmXAV8IMksJLHM91mso0d0YqJbpIc7GqZ72n5QVF23l7OHvwFz6T1END1LxE5+pa/deOWJ1yRaW7vouCRQdejGyb2tH44OdNZP9XVAxYY5bCodNEkALMGAxVDJDESgeKHIn7cGkarV24qWrvsWfMvuI6LYnKeVX3zbi42CiGxO7H2LmO4uJzutyQ+htJOGBSGRygIFlaupeNmG77vjXOWrtZ/LrEM+l21DgwA+z8x3Ibb7hsGDbR/Mjh6ojQ20g1PjOmhKSLAg2DJsMnNmQMcPDyLZ37Eq2t/+36Hy2ls53v5d5K35ARGNPJ8d/ZrYhMyoic25Qh8uR6LrxvGjO94fH9i7MtrXBU6OqqCPSQBuMExAaa0SthD+4oUUqKxHycL6R/JrGn4ILPzB7JP/0tUEt7RIamxUzLx4tOueR4eeundBSE8xsRKO9Sdgs1QcWShLzrruidJVb72yubk5u3nzv+rXSoODOWlfOVVdgNS+j4wc3v23iaG961MDXcjGhjjPBJtSCFbK7S4idSrLrAJFMjJvFQJly/vKFtf/zCg999szdrXjDzvtTm36MxCvxp7YfvPokd2N6ZH9VfGBLiAzqYMmQQACYGgitm2tM8qUwbJFkCUrUFl71sN5C8/9OlHFg7lB4qdqn+Qc2swcVpNP//TQ1h9ebQ+166DQgpkhIMBkcNz2qeKGt6SqL77h6ubm/Kebr71DYsPAyaVr8wlfAbS2dhEAbNq0mmd+d5Lf57Cp7OOEjRtPe+z2JPmQfqijfzN1aNdHpwe6Loz3t8OODnHIUNogSLDjitJC6IwF1rJA5s9fAVG8bLpsScMv/BUXfpuInnVcWk2i+TRKRDqtxEPznNJGrs+MPfPJsSNt78iO7CuM9e+FtKIqaIKI4I7rI7Y0dIp9Mli8GFS8nOev2PCb8MIN3yRZ9Wto+zjXyanuLokaFTObSO35Se8zre8Y79yqIn6W5AzuhZQ+xNNsldRdZZauf8s/+krW/hf+CnASIgpg8PpU785bx7vbz472dcKa6EWQLGUYJEBMggjMkrOW1lkjT+aV10CWrlQVS9f9LDDvvK/lXDinSzW/bAJyS4tEZyfPkXgNmN7xdz1dz25S4/sj03174VMJ5TeFEKwJ0ABJTtu2TlNIhsuXQZauyJYsrH+oYMmlXyUReRysTgPxZh8IZi5WU9u+N7D7V28Z7fiDKvRDsm0BcMiXSMPKX3aBWb7+7S3+qvOd/s2Jw9fqxOAFmXQmCO2ct86pYtbQDCmIWGvWTuxYMbS2QCQBIk0kJZFBJBQADRJMrG2tAQjWgoQKhQpHplPy8cJFG3a8kuWYJyk/NYGJtyX6dt48dGjnpWriICVHDyPIGeUzSBCzExQnwVnFOq38Mly5AkblanteTcOPzLKLZ6NLL9OpTad8Qa2tAo2z7SuYeT0mtn2oZ/9zN6jxvXnTvXsR4IwyDHKco05mE6ctrTMUlJF5tfCVrUyUL173QKD6stuIKBf5JH4Zccs/lsTxq2KHH/7SSNcjDfHunSri0xLaBjODhMHxjLTzl5xnVq6/5v5A9eV/SyTSPL3nU927Hv6yPXkAEgqkcwN+3SJgZnfTTCA4CaxgBgk3m8b9taPZaKbORBCB3feyNcPML0c0b8Xv1156wxuam5tp8+ZX2td4slKF9MbU0HM3jx3Z9cbs6L68xNAhmDqpQqYQBCbFChCSLYt1iv0yb14tfOVrUvOW1t9vVp7zTaLQky/HqU2neAF61is/8obMwO73jx7rfEt2pCsYG9wPH6WVT0oBrVwPvtBpi9kyQjJSWQt/xarp0iXr7vNXXPRl15flhssYgmZu90sn3pyaCWY+Ozv29GcH9j719sTRpwViAypoCAllgUhAkeS4ZaJs1SVUvuaNPzcrL/xbIspmRp/7j6Fd//u5qYOP6yClNEjNkMiJ6s86bZydKGYiKJw74IQL0MwzaV4CDgkFkU5RHgUbrttXc9GHzyWi9J+rcfnJo09clxp64tbJ7rbr0sP7ixJDB2GquPIbEII0aWZASM66RAxXLIO/vM4qWrDqwfCi9XcBZf87s0l03GIviojGSzthx5UipAll918T79l5c/cT33+jGu6k6OghBDij8g1DMLMEK2ginbaIbTMiwwtWoHR+3WjxkoZ7jeJzbieig4BTWbZpUwsTkT4Vd8ccp2zOBFilJ5+7ZWjnd94T7XkuEu/bh4hpa9NHUisbLCRbmlRaFhp5teerinPf8iUjf22TkNJKDT7z7z3bfvm5xJGnVL4PQpAw2CkiypGQ2Y0dExisZ/aH7rk4ZHR7lc8svnTT/lnDqTwhQAgQCQhTkok/c5s8lxjKVc3U3Ewgok4AH2HmL9kTO24ZP7br3amBjpJo/z74OGb7TCmJmfxSS5+w2BrdqyeHDpmZgd3v8HW3vSM8f9WjzAO3A/N+PkfVSwB/kojGS3QeS2D42rH9z950bOvdb8gMdyA90Y2gsFW+hCBmSbChQTppAfAXi8iSVTDLagfKlp91l6/wrO8R0dE5TmF3tBW9RNKB0Noimjsbj8sRTI88+YGB5+58T3qwrXi6bx8CSKkiPwlWzpQskFSxrCH95TVG+fJLh+eddeVHieb/EiBEBx7/yuDuBz+ZPPqMyvOTyChNaVtC+kMEEhBCQpAz51eDIYR0pZpT1KRdN5JrazimoCsOXT+Po/bdYyzW0gwVIK0MGy8z5aulpUUuXTopNmwYUC/FcZwbtHPCg3wIwK3M/DV78XOfHDm86z3ZsX1FU337YFpRFTClkKzIJyD9wmJr8rCeHuumZN+ey5J9ey8LVix/jK2er8JY8L9ElHoh1Uwv0lYIACPXjB185tZ4f+cl6f49yE73c9BQWpIWgCZBErZWOm1JIFAiQlV1CM5bc7h8acO3ZH79D5xs3RPitC/TmM7ZnvH+LR+f6O58rzXc7o8PHYCP08onhQA0SQI0Cx3LEsyC+SI0/yyULj/3h+GFl/8zEfUws4j1Pf6FwV0PfjrZ/ZyK+CFspUnnzUNJ7cVQZt44hI+JREYz4gQSmmARoEDEgmAoTWkiEAMK4ARArJlTYGGRI/Q0CQpAAKyQlUQaRCwNXzyRDfxsacOVvzyd6vfFSJ4/pVFaWxupsbE1d++XZse23zDa3f5xe3Rfaax/H2BNqqBBJFmLXGcwi0kllSAzv1IEylchUl23u7S24VuQy+4jovHnU810ss3FHDuqGOroO8cPt90U7+84K97XDjs2pEOGzZLYmQJEArZmnbYEyXApBStWITx/7aGy5etuQ2BlCxFNHB+n3axPj/Ecf32055mPjhxte7se7ZKJkUMIIaNMR1ARgaAYOpEFZF6lCMyrQ9HiDY8Ur7zi34giW933Mab6Hv36yK5ffSzVu0OHDU3EijK21oElF4klb7r5/wEL/9M9jSSc7GgJQJu+gM6tIOuc7cfQ2i3t1HyCMXii9Qi8XAd3U1OT2Lx5s+7a9durIiHfRdW1G1tIyE7XNnhZcd2TuNUWqFjn9WNH2z6WHupcFO3bC5GZ0EGDIQQLzexuskglbBCFykT+gnoEKlYfLVvS8F8I1f40J4RaWlrkJpcL9Dw3eD5SXX871t35kUR/x/Jobzvs+CiHfawlaQkwSAjYCiplSzIjlSJUuRqRBWvaipduuA2+JQ8cH1M85UU48bxCQN+bYsc6PjZxrO11mZG9SIweRVg4jYSImUgIWMw6bQlwoEiEq+sRWbCurbT2vH+XgZqfaWVjy5Ym4/LX/Zs93f/Y50d2PfR/Use22XmGNkjbAJjTCuAFl1Ltm266yjQX/f6VcnE1NYGam5twqvHWXHTn0K6HbjOm9v2D0jo9r/asR4PVa78BlG0losRL3RS8iOhKKRJd7x851v7B9GDnivhgF6zYiA6ZDEOwIA1nkwfoRJaBQJEoqF6LQMWqvpLFa+6UBQ13EdFAzv6nubluzFyuYh03TvS0fyI92LVgsmcPOD2mgwbBAAsnQVlAaVZJZZCvYL4IzqtHeN7qJ0tWnvM1YP5DL0bvn8JF5wPdm6aPtH0i2tu+LtHfhexUH4LSVoaAIO34rRSTzmhiBEpkaF4dQtX1XeW1Z30VvtofzZ7XdpPobIszh6/vfepnP57o/J3K92mhtU2CASLmlA1S1ZdgzVtvvQKoeARbt0ps3Khy6e30KonN5QiYHnjy/w5tu/dfxnvaKb9isQyU1SJSXbe7YNGar8G37IEZLTQbOz8dWqgY1uFNY4d3fzg50LkhNtAJKzqo86RmUzrJwgSCIsEZi7RtFsiC+avhK181UrK4/m5fyYY7iehoTgJWIdZx49DhnR9LD+2rjvZ1QGQnVcBkghsrJRKsFOskG+QrqhahefUIV655rGTFBbcBpb+a3fm8XOLNbRTJJbCONE4c2XVLYrBjVby3A1Z8WAcNhkksnK0mQSnWWWUwAsUyWFWHYOXq9srVG74O34rWEyQxu868YP/Oe5+b7rhvlT89pom1nNGIgjljC9ILLlV11/79pUQlT71ae/bNRHkmtn9ueNs9/zF99GnbEAYlbCF8+eUUqKhFsGJVb8mShttlZM1dJ9hip4uIQaD7uolDbbfEB7rOSQ20Iz05wCFhaVOwAJgYgCbJGUvorIjIguoV8JXVThQuXvsjIzPy7JeGd9793szovsrp/i7IbFQFBQthaglmMEm2lNZpZYhg8UJZULUW+fNXP1pc0/ANw1dzn7IyJ9ob6lSIt3XrRrcZuNOvD5n9N4zv++nN8d72hfHBLnBiVIdMQtBkwW5s2NLQGSUgQmUiWFkHf9mKtqoV67+OvNU/nVE/swa5ys3tYB45y5rqXa0SEywMLZkBp32ka9YJApHMAnlTr+5gm5NcCzMQJdOvAWgp2ZcvFXRmSMcPDyHW274gPdDxRX/Fypt5as+3UVB/DxF1n6pdfoILR7ia5YfM3FJcs+Ht0SO7b5zo6XpDZqhdTo93c9CwleHMkqKA1NJHUU71PKun+juLU4Odf2f0P3Pvp+ND+yHtaRUyiSC1dBMf2FKsLfhksHSJzC9dhZLF9T8vWLLhf4DSh+Zm6b4c4jmpWpsVsFkzczky+z82tf+nH5zuaVsw3dsOI+NIYmFACAaYBGwNnbEFRH65CFfUw1+28uny5Q13yLxVLScxAdScbABnjsLE0AKVHGNTaMbcbPcZbzNBCmkD/pSTVND8KiXgRkfLBIr2pyhfxJXflIayDQFJWomwQSBM6VT3kzzd374wPdTx+UBp7SczI0//1Fd2/teI6PCpSsTjidgqiCgD4CeA+Anz0Jvj3TtuHjva/kZ7rEvGRo7BT1nlkyQEbAoYLP2U4OzgTm1k+p9TeQYIBkvHj0CctaGzIijzKpZJf0ltumr5+tZA1Vk/ICp8+CRhl5dJPKezgZ7a+ZHRPd+/ITHUuTDa2wlpTamIQSQMlswKIAFLQadsJn/xQlFQWYdgee0zpcvP+ip8Na0nSdX64/NyW6hpOxMgzhIxHPeg4z6eCW0QCwjDVMhVxDU38+lqy3GaPcpuLmDVY4VLz/2a9AX+Ltm7w0hO9SJASvkMEmAtAoaGH9M61f00T/e2lycGO2/xl+96d3roiXv8FRd9PRcUmFu8dapEdKoZyx8C8BDz1BXpvu23jBzreFN2uNOIjRxGgDLKlCwEKwpISMNnQDrKR3DaYm0bERmsqpXB4tpoZc3anwTnXXoHEe10As8QaG6hUydeiwQa9Rwbb1Vm9Klb+5/99luz4wcro32dMKxpFfERwYB023+zrUmnFQlf8UJRWLUWxQvWPJK3sP4uyMU/PYnt+cLnZQg5K/XIdRA70o+FhIaAyB3wKgYBDNrMwOYMgE8yT/wi3bP6luFje95mj++T00OHERRp25RCErQImoAPCbYGdun40P7i9FDXJ0TBtvdMHPztL4pqNn6DyL9r8+bGU/Il5oiYuxcOEQsfBvAwc/TSzOCuj/YdeO6dPHnIHx85goBOKZ9kYWiQtixiZebL4KJaGSqqnaisWffDQPkFX83VWhz3ZLgneCr5eHMM17p4/6O3dD/xjb9R4/sK48P7YKikCksS0keSCNAMzijWWZjSX7JEFlTWo3xJw8P+6nXfIDH/gRMzZl5S8gK7KdBOz/C5q+iKSA1yokQhVwLSn5OMuWlKL/bmMzM1NzcTUfGjAB5lTl5sjTz38YEDu67Tk/vN6MB++HVamQYJIiafVNJHSbaG2nRq6EChPbH//aPdu94d7/7dg3kLz7tLmqW/eTmbyuO7dzVqovzHADzGzF9JDz76yYFDbW/hsf2R6NABUNtd13K4chUC5bX9pUvqf+wrOfcbRNT3cnO+Th7wjl2pxnZ/pKfzuTep8QOhxPABBJB0UoBcv5kC2LZZZ8gv8ypXQBTVZCpr1j8cnH/uHSRLHpzNEWT5UqVwzm2RHN15/eAzP/xxtn+HNgmCiSDZya9gIs7Yksxlb0jXXPXZc4mo/c+5C54bEXHj5C/65nNLizwhQ+mczPCTnxg+svsaPXGoJD50AMKKqoBBJACnFJUk25p1QhkyWLwYgfKVKJq/6tH82nXfAhb+3J1j8jJ9iSyamwmbN+cSh3hlfGDrZ8ePtL/VqNjQeKhkydofG/lr/ztXBzDnwvVLtX1OjB+TNKHtkbdnh3d9qOfJ71ydHe6i5MhhBJBREQkhiSQTwBA6Yym2jIgMz18hAyU18bJl634ZqrzwdqLAM3Ozoh2Jd+rjT01pRkHSEXRyNpsFYAh2Eg1sOyOBhPnndas45HP8ntBOpdqLj5PPiWDleuk8B+AGZl5iT+345OSxPdclhvZWxQb3Q2SmVMCQJKGFSSwLDYvtqYN6avSwSPXvvmyqb89lkaqVOzh18A4Ean5MRMlTJeLcIqrm2Wq+G5l5hVHR8J6zTxK1OIUEgZN1Jx16W6K37SM9T3739enBdqRGjyIolIoYJAQgwYByU7WUmS8jC2pRNG/VQNHihh/7Ss6/I7dLg9tSQjS+RFX7fCZgMM8SZsBNHphtzEa5LqlKs0G2CUwuBrATaH3Fq5K4qUm4RVCLu7bc9YDfsAtjfY/fG55/8ZcBjL8UlTz3hre2NpKbAHIrM3+5JLrnQ2NHdr0rPXp4RXywCzo5qv3ShklMhoQskBo61aej+/qR6Nu9Idqz505/+fJPcbz9+8hbcxcRDZ+qU3v2vJpEc/NmENF+g4imndjcqW4sTlbne/S90aMPfCDat+/cZP8epCd6OSRtnW9CkhNLhc3QGQuszEJZsKQOwcpVvWVLGu5Cwfo73equ41K1Tks/k02bXLdFYcIM5kMxgZyGRsi1pNJOLyQ7RFlDT42sA/CLXDH7K7mbQF0dMTON7f/1N42xHfXjw93g5MBn5Oi4XLr+bZ/asqXJgDss8VRuuFuZ2AegmZm/gvTB68eP7P5YdKCrPjO8H5loPweE0j5JBCiR5xPQ2SGdODSMRP/u2sxQx3+Y5Ss/ztFd30Zk3XePL4l9qb7EzTPnZbhi/5SIt3XrVuk2iXS6k6pj7x3bd99HUsN718V6d0NFh7RfakRMImKWrAFFUqdtyewvkvlL6uAvXdlbsXT9V5Bfd8/M0zV7Uer01k3l/HlFPZaRF2MpI4DNboYeGApghiEFZaMjSIwO1ABgXH75K9rMh7VjzzIPvjk5sOdqa/SAVWyCVXxMFC0P5r18b83sDXfLN6fhdO2/u6S29+rJI7v+cbJnz8WZkb2UnOznkMFKShKClQiaAOwJnTj2BKv+PfOt4a5/889r+wjHdv8A4Ya7iegIkGuOCf1SiWicQoXZXIlnO/bK4etHOltuzozsWxPt2QUVH9EhgyFNFsRONqYC6ZQtwP5SUVBTD39F3eHSpQ1fl+GV986kas0UQ79S3ZuaGdhMAPr84ZLdgXDBJSo+pAWEZGLXHcMQRCI5MYCpiYErmbkEwISTXX/6s5WdHSwxM0dGOlr+M3p0B/J8LONpReHC+VSydP1DALBxYx2fPiIe5zy+X5r+++1s/xXRo9v+Zaq77ZL0UJdMTPYhKLTySQjStghJQPG0Th17iqN9HQvS/W3/FKhc+zFrbPt3jZIN3ySinlmSv/iNq/ESFmruGytmLoJ18G/GulpvTvR3rIn174FOjKiQyWT4SDgZSU6CQMoiEuFyEV68GnlV9T1lSxtuQ2jl3SdpB/GKShoiYrdBuJ0aevLpdLjskmx0CFKyO5WaoJ2ICLGVZBXtL4XqfhsZi+96xQbHtLaKzZuhPvXhJ//f9MGn1sjkqKKAJBEsRKCo+ghQ9ohrP+jTuQ7HRzEaFVHpw8z8aP6SDa+LH9t189jRPddYY11yevwYgpRVPgFhMAvDBAKU0Ome7Rzt31ecHmz7jFmx+8OJ3ie/F6q+8G4ns3qzkyf+IlrBGS+OeMd1J12sptveN7znnvelBtuXJQa6oJLjOmgyTJ+zsXDIJ1TcImGEy0X+0tXIm792T2nNhi/Dt/QhIpr6cxLv+OjVKANAoGLVr2Xh4s8k+/YKUzouGD2nTa/fIE72d2Li4PZbmPme5mbKnOakUcLWrZIuv9zmxN5bDj32048kettUfkDIRNpS4ZqVomxJ/c+IKPVKuYFOdB67LpffAvgtc/KSRN8znxg7uus6NbZXRocPI4isMgwIYiWCJiHACc707dTR/v1FmYql/2B07/x4rPuRH4YXXv5tIrETjS/czZ/+JPGaCTTru6m3J7bfNHqs/V3Z4c7iWH8XODOlAwYgBYSTqCSglFAJW4hAURUFKlYjUr3m2eKas74MY9EDMz6lv2hLMAKzJgDm1JFf/37wmR9fIqK92iCWuUROciveEjZ0cPEFoub1N3ydQvW3nq7znpv1w9x309Cz93+r/7n7daFpExM4KfKpZP3bh+ZvuPEsEA3DqUn5sxUrzR3WzcznxXq3fGLiWPu7eGKfMT10EAGkHdUMdvPTBFs2dAp+mVe2GKJ4hSpZ2vBg/qLzvwpEHv9THS3o5MSb29kge4E9tfum4QM7rrNG9oamBw/AsKZUwABJIqFZOyegoJPKFKGypWSWrkKoovZ3FXUX/DdQ8etXB/GODwk6xepjV43saP1t/zM/UxGfEqRsp/xNuaMbpIEpS+j5575DVJ676Rai+bdzEwTqWk5pYtEfpzL13Ty0/YHb+7f9UkdEigxBlLDIDq94nbHw7Hd8xCha852/VCqYsxFs1HOGd69P9j3+iYn+zuvVaEcgOngQpkqqgElEWgswA0KwpUinlE/6S6thlq/SZcvWPxVesO6rQPmvT5YrauTCPkCrQHPnXFVbb01s++Tgc3e/JzvY4YsOHoRPJ1TEgBAmSTBDM9jSpJPKlJHK5bKgtA6FC+vuK1py7jdJlm2ZE7UwMDuMg2Y/84V2rM0vj6hOCG3uz+yqHrcfIX5fuuzCL6THej47efBJO2KaBrPtPpcCpBUihqaebQ+ypcTXmAf8JBbcBm50XUSbAHTyC5wnAa3U2grMcVVV2NM7Pj/4xL0fGGz7PUdkhkwCpS228uatMQuXnHO/Wbz2O9zS4u6O2fWUNz/PMv2Jz8+tQfOJnoDmE95j7jfNbhyciRkCzc3sFqJ/kJm/khl5+hazp+M6a2RfcXxwH6QddYgIFgZpme/LsD11RMfGu2VmsO3iyIKGi/MXNuxgHvwSUPnA3J6EJ5OA9dbYs/8wfqztukR/Wzg+eBAhV+QCmhgMBWLLVjqtfTJctRxmeYNdsnDNPeEF53+HKPTEjPOYt0i0jvKrbb5Zzu/p5DYzpo7+9qHRXb98U7q/0wqaMKEttwyTwcRQEBy1A6ha9waqWn/lj5G3/t9yTXv+hEnDJ1nbfKDvbZP7t/3L9OGnlk0e2ckRU5EgDaXJzgYqjfL17+gqa3jXFSAacuo8m+kv3R7OSUxoBVqPi7asxtTO9/Qf2H29mty/KN7fCZGdsv2GEIJZMGuAiG0GJ20Bs6BKFC5ch3D12l2RJev/HZh3PxFpkqYfdjZdAIxekhroumGie8+bMiP7QvHhQ/DrpBPAhqZcqpblxmnDFTUwy+uyFcvXtfjLz7kjRzw3fkzAVpqTYJoPoAiAz/1nuRJRu9+f7MZlXQNZ44+re+YerzFbV8vu97nj5QnvqQGkiSjhTtLMhb6Kpo/8+r6Rtoc2JnrbVcQHp6ge7GxNiMFkcCxLnL+wQRQs2jAZrFh+f7iq4V6gYC+AIWH4bVZqzk2zDQBBAOXA+JLU0MFr0lPdb5rq7qhNDHZBJEdVwIRgZrJstm1/uVG46o391Rfe+EYif4croeFGR0wAVXDSw3LXpOZ85ROufe76iBMeDnPOWuS+KndDKt2/N9yvFoBxIsoeT8RW0GzVXDliez48eHDXR9XEgQVTPR2gzKQKSCZJWrB7WhrQKUtAFswXwao1yK9es6140drbaWLPvU+kM8lSlRhbkRk7jMTYEfg5pfxugoBmDS0kW1loS4ZlaF4NfKWr4pXLGn5ilp9zF5HvmTkxQpxAvBCmOz89emz3u5LR0TLSHGLmgCDKQJJmsCYWaQK5NgRBgxkazIwMCbLArJ1W8Q4dBAmaHegGMLMWQrjDNYQzEslNcSG3kTnDnUkIsqQZTOdXrfpFwZJL/68rCXMquXD62O++O33g0XeO7X+Kg0hrnxSSyZ4ZJkdSIp1llRF5Mly6CKHSxbBEaNSfl380GMjPGgG/DRIQWkPZ6bx0KhbOpOLVhkpFEhN9SE/1gdJTTiUZkVAKnMwq5StZbkRqNx6rOued1xMVPO3aSO55xRsG2x66MzneV2OaMgmG6XT4YOUsgLYZpN0pd4LZTe6eYR0Jt15euDm3PjcLVwFgpVkTYDPDB7B0Nh9sMjMrG+lAYdlQ9doLv4nA8h/mbPktW7YYGzdu1EDr3LqdcsTaPzB4cNeHs2MHliYGu8DJceU3NEloQdAzFZQpJSHzF4j8yhWg/T/cxCqbhpWa1kGh2DBIEDnVcpqkzlialRGRoYoVkGUrJ+bVNPzIV3rBd3Md6GdzBI9rIRuAdfR94we2fSLZ31Ef62sH7DhYK0A7OXggkXMFzDy2mhjCEUwgku5xc8oZcyVBuS7lxHOKHXPf03GpVcSzx0AIZLSJyjWvR+m6a/+Ogku/4Tw4zrkzs0B01+ae9sc/l+rbIRKDhxCSli0NIYk0QWsQSTAEK806YzMJMyCkPwxpBkFSgkGQDCg7A9tKQ1lJkJ3VpgE2DEGSSDBYp7NKK1loRBadheLlFz0Sqbnmw0R0hLlFbt1aRpdffrnNnKmf2vuL3wzv+fX87EQfDDdDEm4JpJNG60Swc+bEzBwUYmc37169IxYJzgPJM+sPAoiFI+u1U0jklJRqkDShzXyEq9egYEHds4W1Z38Lcsm9x0vEZkZr3dyWKEVI7r1h9Mium5KDe1fE+tvByVGdZzCkgLtplbA1qbQN0KE7L7LBzo42d5oM0imLWfuLZH71ahilNSOVyxp+IgrP+fpMGrfr8XY4RLk5uGFYB987cWjXR6M9HQ3JgQ4gNapDhoDDKqdxBbsdLtztlbMIoFl+OYvKs24Tt5Yo90zPUA4z0y7ndsOgXH6zKwqE61thAEySo3YIFWe9VVac8+ZPEFV/c+7O2Pk+enG2/5lPDRzc/VY1cQCJkaPgbJQDEsogIhAJIQSBCFozM6DBBM3s6jsGCwKRc7AURFqzVpp10mIpQ4UUrlgOs3x19/yVF96GgvrbXVNAYOtW4Qwz5LXxg798qG9bywKKHbN9hpCslSPf4FTvzawE00xHhpmVILfrK+eIxq6+1Y51q3PPKc9o+xy5iYT7NgKaiNOKQKEyEZy3GvlVK3eU1Jz9LQSWf+9E98oJxUoRJPd9YPJY2wen+jvqUwMdUIkRHfQRDEBobQNCgg7feRHDiUKxZnBaSRKhEhGuXIXQvBWHipfVf09G1v/oZKGWuY5Z5u7GyQPbPxvraV8f7WsHJcatkA8gKKGVdjQAsatI4Qb/c0+xI9EcJmq3xpuOq390FpPg3GINuNIvx2SiWQrOEhAgh+6zafcEKOHjmMpDycrLjfkNV3xVFDR8mohsbnL9c5s3uwNykhuTA0+/b/Ro15V2dKBaxweh4qOwElPQdpYNARaCWJCYuWm5shJmDRICltZkK0H+vCISkXKI/CqEihfuL69Zf59RfPbX3BS4nGeAHSJGL57sfOCege0PLTCSfVnTgAFtM9wpTjwz3Riznznzv3BXwdU0PCMTc4HnuVOI3XV3Hxrm3NPqSlP3ugRBE3QyC3CwxMyvrkdhVd1TRYvWfpMiq+9x/zZnT/9xV43skXdHj+365GRv+5rEQCfs6BAHpNJCgGj37ZewYUhIMwIKlcAoXoLC+St2lSxa+0OEV31vNmrhNPie68NramoSH7jhzddmpwc/IVKDVyR6O6CTYwgargifUZviuNZSMxKM57zAuTltPNPijATNddu7i+5ag+zELih3B9zn2/mY2ddm3sPpMQvNCiQMaAjEsxLFNefAKKt/cn7tWW8GCqdnxawTxXYXsQB27+WxgX3XTQ91L8zEJ9cYOlWUTkwCKgPSGUApgG3wzE2T0NIP6YvACBXDzCvaXVCxuDOyYOUDkAt/NVu150jelpYW2djYqMb7d314qrf9ztiRJ+HLTCDgI9jKdnjBjqp1YtbkCMMZ7UCz18080xpu7taNZ7YnPEdlu2PKSMP15c32W3KrBTU0IASEEFCakLEYZl4p8ubVIeureDaQX/mFBSsu/OXclLGTt3fpfnfs8O6PDh7ecw7F+qBiw6Ajj3yJtdZTgbzCvkjF0oP5S9b+D1DxuxeYHzGTot53dPsXM9GBc+zYSLogFApICZOhXOFDGiLHPiYhJDSDiZm1syswyOnWk2WlXOklAOlm6QCWq2/ctm3EjurQIBKGYz9rnVO1JIi0q0+EMwBTsftMCieXQDCEBNjWiokEVNJGBoHyeGH1ko9GIjUj3NQkZpzwLS2yFa3I9UmZXVhUAdGFqem+hXY6WguVOhtW2oSyBUOADKlJ+tOW4d8ZCpV2+iO1hwAcyjliT7auOYfz0JGn/5lTIxeLbMz0SRHQWitI+MGkBaDAICYyiHU294jl9Eduw8bEUkDkmnkxhGN65w4hKZ2gt5gjBhkQUhA0aaU1OwKdco81IFyjiImISNu2sqOpdMYMFAcoPG/7otoLP+P4DY+P2py0XTDGLoj1tH80MXJ0JTHzGgBxACO5rFfAGS2f6wbw4qNchitxCEIQtNYQQhxfd4HZOgxtZx3eGL45k4wAVid7nWdHmzNA0ukypZlnngZBs7aQnU2TMPw8V4kLQbCzaSlNv8pJElYKufqSFwxRzfGDnXp0wUkseKF1JWlCCAGtNbSdlQBY+gKanGuT0vSr3DUz52LY2hVi5Ehh8B/VvGit5/xNTkrSzL6N3f42RM8bP4Zmno0WvchSmefpSRj4o6xcbmmRLy5SMfskM7fIpiYInJ7kPfoTr9NJ/ID0QnHtF/q8LVu2GHM3yy+0kMxNgpkFt7TILVuajJaWTZK5SXATnH/cJJzXWqS7nuLFrilzi2xp2SRfzvW8zN+/2PegpiaIlhbn/r+UcKSzHq69ndsC5Qzglx/Mfq2B8EoMIjw9iQF/3ev22uSLBw8ePHjw4MGDBw8ePHjw4MGDBw8ePHjw4MHDi8X/DzJicx/BmnftAAAAAElFTkSuQmCC';
+function renderLogin(err){
+  app.innerHTML = `
+  <div class="login-wrap">
+    <button class="theme-switch login-theme" id="lgTheme" role="switch" aria-label="Toggle dark mode" title="Toggle dark / light mode"><span class="ti ti-sun">${SUN_SVG}</span><span class="ti ti-moon">${MOON_SVG}</span></button>
+    <div class="login-split">
+      <div class="login-aside">
+        <div class="aside-badge">E</div>
+        <h2>Welcome to Elliana</h2>
+        <p class="aside-tag">Your all-in-one clothing store management system — track inventory, ring up sales, and keep your team in sync.</p>
+        <ul>
+          <li><span class="tick">✓</span> Real-time inventory &amp; low-stock alerts</li>
+          <li><span class="tick">✓</span> Fast point-of-sale checkout</li>
+          <li><span class="tick">✓</span> Sales history &amp; team reports</li>
+        </ul>
+      </div>
+      <div class="login-card">
+      <div class="brand brand-logo"><img src="${LOGO_FULL}" alt="Elliana" class="login-logo-img"></div>
+      <p class="login-sub">Clothing Store Management</p>
+      <div class="role-toggle">
+        <button data-role="admin" class="${loginRole==='admin'?'active':''}">${IC_ADMIN} Admin</button>
+        <button data-role="sales" class="${loginRole==='sales'?'active':''}">${IC_BAG} Salesperson</button>
+      </div>
+      ${err?`<div class="login-err">${esc(err)}</div>`:''}
+      <form id="loginForm">
+        <div class="field"><label>Username</label><div class="input-ico"><span class="lead">${IC_USER}</span><input id="lgUser" autocomplete="username" placeholder="Enter username"></div></div>
+        <div class="field"><label>Password</label><div class="input-ico"><span class="lead">${IC_LOCK}</span><input id="lgPass" type="password" autocomplete="current-password" placeholder="Enter password"><button type="button" class="pw-toggle" id="lgPwToggle" aria-label="Show password">${IC_EYE}</button></div></div>
+        <div class="field" style="display:flex;align-items:center;gap:8px;margin-bottom:18px">
+          <input type="checkbox" id="lgRemember" ${rememberMe?'checked':''} style="width:16px;height:16px;accent-color:var(--accent);cursor:pointer;margin:0;flex:none">
+          <label for="lgRemember" style="margin:0;font-size:13px;color:var(--text);cursor:pointer;font-weight:500">Remember me on this device</label>
+        </div>
+        <button type="submit" class="btn-primary">${IC_LOGIN} Sign in as ${loginRole==='admin'?'Admin':'Salesperson'}</button>
+      </form>
+      <button type="button" id="fpLink" style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:13px;margin-top:16px;text-decoration:underline">Forgot password?</button>
+      </div>
+    </div>
+  </div>`;
+  app.querySelectorAll('.role-toggle button').forEach(b=>b.onclick=()=>{ loginRole=b.dataset.role; renderLogin(); });
+  { const fl=$('#fpLink'); if(fl) fl.onclick=()=>{ fpStep=1; fpUser=null; renderForgot(); }; }
+  $('#lgTheme').onclick=toggleTheme;
+  const pwBtn=$('#lgPwToggle');
+  if(pwBtn){ pwBtn.onclick=()=>{ const pw=$('#lgPass'); const show=pw.type==='password'; pw.type=show?'text':'password'; pwBtn.innerHTML=show?IC_EYEOFF:IC_EYE; pwBtn.setAttribute('aria-label',show?'Hide password':'Show password'); pw.focus(); }; }
+  $('#loginForm').onsubmit = e=>{
+    e.preventDefault();
+    const u=$('#lgUser').value.trim(), p=$('#lgPass').value;
+    const user = DB.users.find(x=>x.username===u && x.password===p);
+    if(!user){ renderLogin('Invalid username or password.'); return; }
+    if(user.role!==loginRole){ renderLogin('This account is a '+user.role+' account. Switch the login tab above.'); return; }
+    const remember = !!($('#lgRemember') && $('#lgRemember').checked);
+    rememberMe = remember;
+    try{ localStorage.setItem(REMEMBER_KEY, remember?'1':'0'); }catch(e){}
+    session = user;
+    saveSession(remember);
+    activeView = user.role==='admin' ? 'dashboard' : 'pos';
+    renderApp();
+    maybeAutoAlert();
+  };
+}
+
+/* ---------- Forgot-password recovery (offline, email-on-file verification) ---------- */
+let fpStep = 1;      // 1 = identify, 2 = set new password
+let fpUser = null;   // matched user record
+function renderForgot(err, info){
+  app.innerHTML = `
+  <div class="login-wrap">
+    <button class="theme-switch login-theme" id="lgTheme" role="switch" aria-label="Toggle dark mode" title="Toggle dark / light mode"><span class="ti ti-sun">${SUN_SVG}</span><span class="ti ti-moon">${MOON_SVG}</span></button>
+    <div class="login-card">
+      <div class="brand brand-logo"><img src="${LOGO_FULL}" alt="Elliana" class="login-logo-img"></div>
+      <p class="login-sub">Reset your password</p>
+      ${err?`<div class="login-err">${esc(err)}</div>`:''}
+      ${info?`<div class="login-err" style="background:var(--accent-soft);color:var(--accent)">${esc(info)}</div>`:''}
+      ${ fpStep===1 ? `
+      <form id="fpForm1">
+        <p style="font-size:13px;color:var(--muted);line-height:1.6;margin:0 0 14px">Enter your username and the email saved on your account. We'll check them against your records so you can set a new password \u2014 all on this device.</p>
+        <div class="field"><label>Username</label><div class="input-ico"><span class="lead">${IC_USER}</span><input id="fpU" autocomplete="username" placeholder="Enter username"></div></div>
+        <div class="field"><label>Email on file</label><div class="input-ico"><span class="lead">${IC_LOCK}</span><input id="fpE" type="email" placeholder="you@example.com"></div></div>
+        <button type="submit" class="btn-primary">${IC_LOGIN} Verify account</button>
+      </form>` : `
+      <form id="fpForm2">
+        <p style="font-size:13px;color:var(--muted);line-height:1.6;margin:0 0 14px">Identity verified for <b>@${esc(fpUser.username)}</b>. Choose a new password.</p>
+        <div class="field"><label>New password</label><div class="input-ico"><span class="lead">${IC_LOCK}</span><input id="fpN" type="password" placeholder="At least 4 characters"></div></div>
+        <div class="field"><label>Confirm new password</label><div class="input-ico"><span class="lead">${IC_LOCK}</span><input id="fpN2" type="password" placeholder="Re-enter new password"></div></div>
+        <button type="submit" class="btn-primary">${IC_LOGIN} Set new password</button>
+      </form>`}
+      <button type="button" id="fpBack" style="background:none;border:none;color:var(--accent);cursor:pointer;font-size:13px;margin-top:16px;text-decoration:underline">\u2190 Back to sign in</button>
+    </div>
+  </div>`;
+  $('#lgTheme').onclick=toggleTheme;
+  $('#fpBack').onclick=()=>{ fpStep=1; fpUser=null; renderLogin(); };
+  if(fpStep===1){
+    $('#fpForm1').onsubmit=e=>{
+      e.preventDefault();
+      const u=$('#fpU').value.trim(), em=$('#fpE').value.trim().toLowerCase();
+      const user=DB.users.find(x=>x.username===u);
+      if(!user){ renderForgot('No account found with that username.'); return; }
+      if(!user.email){ renderForgot('This account has no recovery email on file. Please ask an admin to reset your password from the Staff page.'); return; }
+      if(user.email.toLowerCase()!==em){ renderForgot('That email does not match the one on file for this account.'); return; }
+      fpUser=user; fpStep=2; renderForgot();
+    };
+  } else {
+    $('#fpForm2').onsubmit=e=>{
+      e.preventDefault();
+      const nw=$('#fpN').value, nw2=$('#fpN2').value;
+      if(nw.length<4){ renderForgot('New password must be at least 4 characters.'); return; }
+      if(nw!==nw2){ renderForgot('The two passwords do not match.'); return; }
+      fpUser.password=nw; saveDB();
+      fpStep=1; fpUser=null;
+      renderLogin(); toast('Password updated \u2014 sign in with your new password');
+    };
+  }
+}
+
+function logout(){ session=null; cart={}; loginRole='admin'; clearSession(); renderLogin(); }
+
+/* ============================================================
+   NAVIGATION (role-based)
+   ============================================================ */
+const NAV = {
+  admin:[
+    {id:'dashboard', ico:'📊', label:'Dashboard'},
+    {id:'inventory', ico:'👕', label:'Inventory'},
+    {id:'sales',     ico:'🧾', label:'Sales History'},
+    {id:'staff',     ico:'👥', label:'Staff'},
+    {id:'alerts',    ico:'🔔', label:'Low-Stock Alerts'},
+    {id:'reports',   ico:'📈', label:'Reports'}
+  ],
+  sales:[
+    {id:'pos',       ico:'🛒', label:'New Sale'},
+    {id:'catalog',   ico:'👚', label:'Product Catalog'},
+    {id:'mysales',   ico:'🧾', label:'My Sales'}
+  ]
+};
+const TITLES = {dashboard:'Dashboard',execsummary:'Executive Summary',inventory:'Inventory',sales:'Sales History',staff:'Staff',alerts:'Low-Stock Alerts',reports:'Reports',pos:'New Sale',catalog:'Product Catalog',mysales:'My Sales',profile:'My Profile'};
+
+function renderApp(){
+  const items = NAV[session.role];
+  const initials = session.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase();
+  app.innerHTML = `
+  <div class="shell">
+    <aside class="sidebar" id="sidebar">
+      <div class="side-brand">
+        <div class="brand-id">
+          <div class="logo"><img src="${LOGO_ICON}" alt="" class="side-logo-img"></div>
+          <div><h2>Elliana</h2><span class="role-chip ${session.role}">${session.role==='admin'?'Admin':'Sales'}</span></div>
+        </div>
+        <button class="drawer-close" id="drawerClose" aria-label="Close menu">×</button>
+      </div>
+      <nav class="nav" id="nav">
+        ${items.map(it=>`<button data-view="${it.id}" class="${activeView===it.id?'active':''}"><span class="ico">${it.ico}</span>${it.label}</button>`).join('')}
+      </nav>
+      <div class="side-foot">
+        <div class="uname">${esc(session.name)}</div>
+        <button class="logout" id="logoutBtn">↪ Sign out</button>
+      </div>
+    </aside>
+    <div class="overlay" id="overlay"></div>
+    <div class="main">
+      <header class="topbar">
+        <div style="display:flex;align-items:center;gap:14px">
+          <button class="hamburger" id="hamburger">☰</button>
+          <h3 id="pageTitle">${TITLES[activeView]}</h3>
+        </div>
+        <div class="tb-right">${themeSwitch('tbTheme')}<button class="avatar" id="avatarBtn" title="My Profile" style="cursor:pointer;border:none;font:inherit">${initials}</button></div>
+      </header>
+      <div class="content" id="content"></div>
+    </div>
+  </div>`;
+  app.querySelectorAll('#nav button').forEach(b=>b.onclick=()=>{ activeView=b.dataset.view; closeDrawer(); renderApp(); });
+  $('#logoutBtn').onclick = logout;
+  $('#tbTheme').onclick = toggleTheme;
+  { const ab=$('#avatarBtn'); if(ab) ab.onclick=()=>{ activeView='profile'; renderApp(); }; }
+  $('#hamburger').onclick = ()=>{ const open=$('#sidebar').classList.toggle('open'); $('#overlay').classList.toggle('show',open); document.body.style.overflow=open?'hidden':''; };
+  $('#overlay').onclick = closeDrawer;
+  { const dc=$('#drawerClose'); if(dc) dc.onclick=closeDrawer; }
+  renderView();
+}
+function closeDrawer(){ const s=$('#sidebar'),o=$('#overlay'); if(s)s.classList.remove('open'); if(o)o.classList.remove('show'); document.body.style.overflow=''; }
+
+function renderView(){
+  const c = $('#content'); if(!c) return;
+  switch(activeView){
+    case 'dashboard': return viewDashboard(c);
+    case 'execsummary': return viewExecSummary(c);
+    case 'inventory': return viewInventory(c);
+    case 'sales':     return viewSalesHistory(c, false);
+    case 'staff':     return viewStaff(c);
+    case 'alerts':    return viewAlerts(c);
+    case 'reports':   return viewReports(c);
+    case 'pos':       return viewPOS(c);
+    case 'catalog':   return viewCatalog(c);
+    case 'mysales':   return viewSalesHistory(c, true);
+    case 'profile':   return viewProfile(c);
+  }
+}
+
+/* ============================================================
+   SHARED — My Profile (change password / set email)
+   ============================================================ */
+function viewProfile(c){
+  const u = session;
+  c.innerHTML=`
+    <div class="profile-view">
+    <div class="kpi-grid">
+      <div class="kpi"><div class="k-ico">\u{1F464}</div><div class="k-label">Signed in as</div><div class="k-val" style="font-size:18px">${esc(u.name)}</div><div class="k-sub">@${esc(u.username)} \u00B7 ${u.role==='admin'?'Admin':'Salesperson'}</div></div>
+      <div class="kpi"><div class="k-ico">\u{1F4E7}</div><div class="k-label">My Email</div><div class="k-val" style="font-size:16px;word-break:break-all">${u.email?esc(u.email):'<span style="color:var(--muted)">Not set</span>'}</div><div class="k-sub">Used for your account</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h4>Account Details</h4></div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div><label class="lbl">Full name</label><input class="inp" id="p_name" value="${esc(u.name)}"></div>
+          <div><label class="lbl">Username</label><input class="inp" id="p_user" value="${esc(u.username)}" disabled style="opacity:.7"></div>
+          <div class="full"><label class="lbl">Email address</label><input class="inp" id="p_email" type="email" placeholder="you@example.com" value="${esc(u.email||'')}"></div>
+        </div>
+        <div class="toolbar" style="margin-top:18px">
+          <button class="btn primary" id="p_saveInfo">Save Details</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h4>Change Password</h4></div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div class="full"><label class="lbl">Current password</label><input class="inp" id="p_cur" type="password" placeholder="Enter current password"></div>
+          <div><label class="lbl">New password</label><input class="inp" id="p_new" type="password" placeholder="At least 4 characters"></div>
+          <div><label class="lbl">Confirm new password</label><input class="inp" id="p_new2" type="password" placeholder="Re-enter new password"></div>
+        </div>
+        <div class="toolbar" style="margin-top:18px">
+          <button class="btn primary" id="p_savePass">Update Password</button>
+        </div>
+        <p style="font-size:12px;color:var(--muted);margin-top:12px;line-height:1.6">For your security you must enter your current password to set a new one. Your login details are stored only in this browser.</p>
+      </div>
+    </div>
+    </div>`;
+
+  $('#p_saveInfo').onclick=()=>{
+    const name=$('#p_name').value.trim();
+    const email=$('#p_email').value.trim();
+    if(!name){ toast('Name cannot be empty'); return; }
+    if(email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)){ toast('Please enter a valid email address'); return; }
+    u.name=name; u.email=email;
+    saveDB(); toast('Profile details saved'); renderApp();
+  };
+
+  $('#p_savePass').onclick=()=>{
+    const cur=$('#p_cur').value, nw=$('#p_new').value, nw2=$('#p_new2').value;
+    if(cur!==u.password){ toast('Current password is incorrect'); return; }
+    if(nw.length<4){ toast('New password must be at least 4 characters'); return; }
+    if(nw!==nw2){ toast('New passwords do not match'); return; }
+    u.password=nw;
+    saveDB(); toast('Password updated successfully');
+    $('#p_cur').value=$('#p_new').value=$('#p_new2').value='';
+  };
+}
+
+/* ---------- shared metrics ---------- */
+function salesStats(filterUser){
+  const list = filterUser ? DB.sales.filter(s=>s.cashier===filterUser) : DB.sales;
+  const revenue = list.reduce((a,s)=>a+s.total,0);
+  const units = list.reduce((a,s)=>a+s.items.reduce((b,i)=>b+i.qty,0),0);
+  return {list, revenue, units, count:list.length, avg: list.length? revenue/list.length : 0};
+}
+
+/* ============================================================
+   ADMIN — Dashboard
+   ============================================================ */
+function viewDashboard(c){
+  const st = salesStats();
+  const invValue = DB.products.reduce((a,p)=>a+p.stock*p.cost,0);
+  const lowCount = DB.products.filter(p=>p.stock>0 && p.stock<=p.reorder).length;
+  const outCount = DB.products.filter(p=>p.stock<=0).length;
+  // best sellers
+  const soldMap={};
+  DB.sales.forEach(s=>s.items.forEach(i=>{ soldMap[i.name]=(soldMap[i.name]||0)+i.qty; }));
+  const best = Object.entries(soldMap).sort((a,b)=>b[1]-a[1]).slice(0,5);
+  const maxBest = best.length? best[0][1] : 1;
+  const recent = [...DB.sales].sort((a,b)=>b.ts-a.ts).slice(0,5);
+  c.innerHTML = `
+    <div class="dashboard-view">
+    <div class="dash-report-bar"><button class="btn ghost" id="execBtn">📊 Executive Summary</button><button class="btn primary" id="dlReport" style="margin-left:10px">📄 Download Summary Report</button></div>
+    <div class="kpi-grid">
+      <div class="kpi clickable" data-go="sales"><div class="k-ico">💰</div><div class="k-label">Total Revenue</div><div class="k-val">${money(st.revenue)}</div><div class="k-sub">${st.count} transactions ›</div></div>
+      <div class="kpi clickable" data-go="sales"><div class="k-ico">👕</div><div class="k-label">Units Sold</div><div class="k-val">${st.units}</div><div class="k-sub">Avg sale ${money(st.avg)} ›</div></div>
+      <div class="kpi clickable" data-go="inventory"><div class="k-ico">📦</div><div class="k-label">Inventory Value</div><div class="k-val">${money(invValue)}</div><div class="k-sub">${DB.products.length} products ›</div></div>
+      <div class="kpi clickable" data-go="alerts"><div class="k-ico">⚠️</div><div class="k-label">Stock Alerts</div><div class="k-val">${lowCount+outCount}</div><div class="k-sub">${lowCount} low · ${outCount} out ›</div></div>
+    </div>
+    ${(lowCount+outCount)>0?`
+    <div class="alert-banner">
+      <div class="ab-ico">⚠️</div>
+      <div class="ab-txt"><b>${lowCount+outCount} product(s) need restocking</b><span>${lowCount} low · ${outCount} out of stock — notify ${esc(DB.settings.alertEmail||'(no recipient set)')}</span></div>
+      <div class="ab-act"><button class="btn primary" id="ab_send">✉ Email Alert</button><button class="btn ghost" id="ab_view">View list</button></div>
+    </div>`:''}
+    ${trendChartSVG()}
+    ${categoryBreakdown()}
+    <div class="two-col">
+      <div class="panel">
+        <div class="panel-head"><h4>Recent Sales</h4><button class="btn ghost sm" id="goSales">View all</button></div>
+        <div class="tbl-wrap"><table><thead><tr><th>Receipt</th><th>Cashier</th><th>Items</th><th>Total</th><th>When</th></tr></thead><tbody>
+          ${recent.map(s=>`<tr class="row-link" data-rc="${s.id}"><td><b>#${s.id}</b></td><td>${esc(s.cashierName)}</td><td>${s.items.reduce((a,i)=>a+i.qty,0)}</td><td><b>${money(s.total)}</b></td><td style="color:var(--muted)">${fmtDate(s.ts)}</td></tr>`).join('')}
+        </tbody></table></div>
+      </div>
+      <div class="panel">
+        <div class="panel-head"><h4>Best Sellers</h4></div>
+        <div class="panel-body">
+          ${best.length? best.map(b=>`<div class="bar-row row-link" data-prod="${esc(b[0])}"><div class="bl">${esc(b[0])}</div><div class="bar-track"><div class="bar-fill" style="width:${(b[1]/maxBest*100)}%"></div></div><div class="bv">${b[1]} sold</div></div>`).join('') : '<div class="empty">No sales yet</div>'}
+        </div>
+      </div>
+    </div>
+    </div>`;
+  $('#goSales').onclick=()=>{ activeView='sales'; renderApp(); };
+  { const dr=$('#dlReport'); if(dr) dr.onclick=()=>downloadKpiReport(); }
+  { const eb=$('#execBtn'); if(eb) eb.onclick=()=>{ activeView='execsummary'; renderApp(); }; }
+  { const abS=$('#ab_send'); if(abS) abS.onclick=sendLowStockAlert; const abV=$('#ab_view'); if(abV) abV.onclick=()=>{ activeView='alerts'; renderApp(); }; }
+  c.querySelectorAll('.kpi[data-go]').forEach(k=>k.onclick=()=>{ activeView=k.dataset.go; renderApp(); });
+  c.querySelectorAll('tr.row-link[data-rc]').forEach(r=>r.onclick=()=>showReceipt(r.dataset.rc));
+  c.querySelectorAll('.bar-row[data-prod]').forEach(r=>r.onclick=()=>{ invSearch=r.dataset.prod; activeView='inventory'; renderApp(); });
+}
+
+// Build a one-page, print-optimized executive summary that consolidates the
+// dashboard's headline KPIs, highlights and category mix from live data.
+function viewExecSummary(c){
+  const PAL=['#3658d6','#6f93f7','#12b76a','#f0b24a','#f0455b','#8b5cf6','#06b6d4','#64748b'];
+  const st = salesStats();
+  const invValue = DB.products.reduce((a,p)=>a+p.stock*p.cost,0);
+  const lowCount = DB.products.filter(p=>p.stock>0 && p.stock<=p.reorder).length;
+  const outCount = DB.products.filter(p=>p.stock<=0).length;
+  const alerts = lowCount+outCount;
+  // estimated gross profit from sold items (qty x (price - cost))
+  let profit=0;
+  (DB.sales||[]).forEach(s=>s.items.forEach(it=>{ const p=DB.products.find(pr=>pr.id===it.id); profit+=it.qty*(it.price-(p?p.cost:0)); }));
+  const margin = st.revenue? profit/st.revenue*100 : 0;
+  // best seller
+  const soldMap={};
+  (DB.sales||[]).forEach(s=>s.items.forEach(i=>{ soldMap[i.name]=(soldMap[i.name]||0)+i.qty; }));
+  const bestEntry = Object.entries(soldMap).sort((a,b)=>b[1]-a[1])[0];
+  // revenue by category
+  const catRev={};
+  (DB.sales||[]).forEach(s=>s.items.forEach(it=>{ const p=DB.products.find(pr=>pr.id===it.id); const cat=p?p.cat:'Other'; catRev[cat]=(catRev[cat]||0)+it.qty*it.price; }));
+  const catRows=Object.entries(catRev).sort((a,b)=>b[1]-a[1]);
+  const catTotal=catRows.reduce((a,r)=>a+r[1],0);
+  const catMax=catRows.length?catRows[0][1]:1;
+  // top salesperson
+  const repMap={};
+  (DB.sales||[]).forEach(s=>{ repMap[s.cashierName]=(repMap[s.cashierName]||0)+s.total; });
+  const topRep = Object.entries(repMap).sort((a,b)=>b[1]-a[1])[0];
+  const store = esc((DB.settings&&DB.settings.storeName)||'Elliana The Shop');
+  const now = new Date();
+  const ek=(l,v,s)=>`<div class="exec-kpi"><div class="ek-l">${l}</div><div class="ek-v">${v}</div><div class="ek-s">${s}</div></div>`;
+  const hl=(ico,k,v)=>`<li><span class="hl-ico">${ico}</span><span class="hl-k">${k}</span><span class="hl-v">${v}</span></li>`;
+  const catBars = catRows.length? catRows.slice(0,6).map((r,i)=>{
+    const w=(r[1]/catMax*100), pct=catTotal?(r[1]/catTotal*100):0, col=PAL[i%PAL.length];
+    return `<div class="ec-row"><div class="ec-name">${esc(r[0])}</div><div class="ec-track"><div class="ec-fill" style="width:${w.toFixed(1)}%;background:${col}"></div></div><div class="ec-val">${pct.toFixed(0)}%</div></div>`;
+  }).join('') : '<div class="empty">No sales yet</div>';
+  const callout = alerts>0
+    ? `<div class="exec-callout warn"><div class="co-ico">⚠️</div><div><b>${alerts} product(s) need restocking</b><br><span>${lowCount} low · ${outCount} out of stock — review the Low-Stock Alerts page to reorder.</span></div></div>`
+    : `<div class="exec-callout ok"><div class="co-ico">✅</div><div><b>Inventory is healthy</b><br><span>No products are currently low or out of stock.</span></div></div>`;
+  c.innerHTML = `
+    <div class="exec-view">
+    <div class="exec-actions">
+      <button class="btn ghost" id="execBack">‹ Back to Dashboard</button>
+      <div class="ea-right"><button class="btn primary" id="execPrint">🖨 Print / Save as PDF</button></div>
+    </div>
+    <div class="exec-sheet">
+      <div class="exec-head">
+        <div><h2>${store}</h2><div class="eh-sub">Executive Summary — business at a glance</div></div>
+        <div class="eh-date">${esc(now.toLocaleDateString(undefined,{weekday:'long',year:'numeric',month:'long',day:'numeric'}))}</div>
+      </div>
+      <div class="exec-body">
+        <div class="exec-section-t">Headline Metrics</div>
+        <div class="exec-kpis">
+          ${ek('Total Revenue', money(st.revenue), st.count+' transactions')}
+          ${ek('Units Sold', st.units, 'Avg sale '+money(st.avg))}
+          ${ek('Est. Gross Profit', money(profit), margin.toFixed(0)+'% margin')}
+          ${ek('Inventory Value', money(invValue), DB.products.length+' products')}
+        </div>
+        <div class="exec-cols" style="margin-top:22px">
+          <div>
+            <div class="exec-section-t">Highlights</div>
+            <ul class="exec-hl">
+              ${hl('🏆','Best seller', bestEntry? esc(bestEntry[0])+' · '+bestEntry[1]+' sold' : '—')}
+              ${hl('📈','Top category', catRows.length? esc(catRows[0][0])+' · '+money(catRows[0][1]) : '—')}
+              ${hl('🧑‍💼','Top salesperson', topRep? esc(topRep[0])+' · '+money(topRep[1]) : '—')}
+              ${hl('🧾','Transactions', st.count+' · avg '+money(st.avg))}
+              ${hl('⚠️','Stock alerts', alerts+' item(s)')}
+            </ul>
+          </div>
+          <div>
+            <div class="exec-section-t">Revenue by Category</div>
+            <div class="exec-cat">${catBars}</div>
+          </div>
+        </div>
+        <div class="exec-section-t">Inventory Health</div>
+        ${callout}
+      </div>
+      <div class="exec-foot">Prepared from live in-browser data · ${esc(now.toLocaleString())}. Use Print / Save as PDF to export this one-page summary.</div>
+    </div>
+    </div>`;
+  { const b=$('#execBack'); if(b) b.onclick=()=>{ activeView='dashboard'; renderApp(); }; }
+  { const p=$('#execPrint'); if(p) p.onclick=()=>window.print(); }
+}
+
+// Build a self-contained, printable HTML summary report of the dashboard KPIs
+// from the live data in this browser, then download it as a file.
+function downloadKpiReport(){
+  const st = salesStats();
+  const invValue = DB.products.reduce((a,p)=>a+p.stock*p.cost,0);
+  const lowItems = DB.products.filter(p=>p.stock>0 && p.stock<=p.reorder);
+  const outItems = DB.products.filter(p=>p.stock<=0);
+  const soldMap={};
+  DB.sales.forEach(s=>s.items.forEach(i=>{ soldMap[i.name]=(soldMap[i.name]||0)+i.qty; }));
+  const best = Object.entries(soldMap).sort((a,b)=>b[1]-a[1]).slice(0,10);
+  const recent = [...DB.sales].sort((a,b)=>b.ts-a.ts).slice(0,10);
+  const store = esc((DB.settings&&DB.settings.storeName)||'Elliana The Shop');
+  const now = new Date();
+  const gen = now.toLocaleString();
+  const kpi = (label,val,sub)=>`<div class="rc"><div class="rl">${label}</div><div class="rv">${val}</div><div class="rs">${sub}</div></div>`;
+  const html = `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${store} — KPI Summary Report</title><style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif;color:#1f2733;background:#f3f4f6;line-height:1.5;padding:28px}
+.wrap{max-width:860px;margin:0 auto;background:#fff;border-radius:14px;box-shadow:0 10px 34px rgba(15,23,42,.12);overflow:hidden}
+.head{background:linear-gradient(145deg,#1f2430 0%,#2745bd 62%,#3658d6 118%);color:#fff;padding:30px 34px}
+.head h1{font-size:24px;letter-spacing:-.3px}
+.head p{opacity:.85;font-size:13.5px;margin-top:6px}
+.body{padding:26px 34px 34px}
+h2{font-size:15px;color:#1f2733;margin:26px 0 12px;letter-spacing:-.2px}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:14px}
+.rc{border:1px solid #e4e7ec;border-radius:11px;padding:16px 18px;background:#fafbfc}
+.rl{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:#6b7280}
+.rv{font-size:24px;font-weight:700;color:#1f2733;margin-top:5px}
+.rs{font-size:12px;color:#6b7280;margin-top:3px}
+table{width:100%;border-collapse:collapse;font-size:13.5px;margin-top:4px}
+th,td{text-align:left;padding:9px 10px;border-bottom:1px solid #eceef2}
+th{font-size:11px;text-transform:uppercase;letter-spacing:.4px;color:#6b7280}
+td b{color:#1f2733}
+.right{text-align:right}
+.muted{color:#6b7280}
+.foot{padding:16px 34px;border-top:1px solid #eceef2;font-size:12px;color:#6b7280}
+.badge{display:inline-block;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600}
+.b-low{background:#fbf2e1;color:#9a6410}.b-out{background:#fcebe8;color:#c0304a}
+@media print{body{background:#fff;padding:0}.wrap{box-shadow:none;border-radius:0}}
+</style></head><body><div class="wrap">
+<div class="head"><h1>${store}</h1><p>Dashboard KPI Summary Report &middot; Generated ${esc(gen)}</p></div>
+<div class="body">
+<h2>Key Metrics</h2>
+<div class="grid">
+${kpi('Total Revenue', money(st.revenue), st.count+' transactions')}
+${kpi('Units Sold', st.units, 'Avg sale '+money(st.avg))}
+${kpi('Inventory Value', money(invValue), DB.products.length+' products')}
+${kpi('Stock Alerts', (lowItems.length+outItems.length), lowItems.length+' low · '+outItems.length+' out')}
+</div>
+<h2>Best Sellers</h2>
+${best.length?`<table><thead><tr><th>#</th><th>Product</th><th class="right">Units Sold</th></tr></thead><tbody>${best.map((b,i)=>`<tr><td class="muted">${i+1}</td><td><b>${esc(b[0])}</b></td><td class="right"><b>${b[1]}</b></td></tr>`).join('')}</tbody></table>`:'<p class="muted">No sales recorded yet.</p>'}
+<h2>Recent Sales</h2>
+${recent.length?`<table><thead><tr><th>Receipt</th><th>Cashier</th><th class="right">Items</th><th class="right">Total</th><th>When</th></tr></thead><tbody>${recent.map(s=>`<tr><td><b>#${esc(String(s.id))}</b></td><td>${esc(s.cashierName)}</td><td class="right">${s.items.reduce((a,i)=>a+i.qty,0)}</td><td class="right"><b>${money(s.total)}</b></td><td class="muted">${esc(fmtDate(s.ts))}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">No sales recorded yet.</p>'}
+<h2>Items Needing Restock</h2>
+${(lowItems.length+outItems.length)?`<table><thead><tr><th>Product</th><th>Category</th><th class="right">In Stock</th><th class="right">Reorder</th><th>Status</th></tr></thead><tbody>${[...outItems,...lowItems].map(p=>`<tr><td><b>${esc(p.name)}</b></td><td class="muted">${esc(p.cat)}</td><td class="right"><b>${p.stock}</b></td><td class="right muted">${p.reorder}</td><td>${p.stock<=0?'<span class=\'badge b-out\'>Out of stock</span>':'<span class=\'badge b-low\'>Low stock</span>'}</td></tr>`).join('')}</tbody></table>`:'<p class="muted">🎉 Everything is well stocked.</p>'}
+</div>
+<div class="foot">Report generated by ${store} inventory system. Tip: open this file and use your browser's Print option to save it as a PDF.</div>
+</div></body></html>`;
+  const blob = new Blob([html], {type:'text/html'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  const stamp = now.getFullYear()+'-'+String(now.getMonth()+1).padStart(2,'0')+'-'+String(now.getDate()).padStart(2,'0');
+  a.href = url; a.download = 'Elliana-KPI-Report-'+stamp+'.html';
+  document.body.appendChild(a); a.click();
+  setTimeout(()=>{ document.body.removeChild(a); URL.revokeObjectURL(url); }, 100);
+  toast('📄 KPI summary report downloaded');
+}
+
+// Build an inline-SVG combo chart: revenue (bars) + units sold (line)
+// over the last 14 days, computed from live sales data. Theme-aware via CSS.
+function trendChartSVG(){
+  const sales = DB.sales||[];
+  const DAY=86400000, days=14;
+  const anchor = sales.length? Math.max.apply(null, sales.map(s=>s.ts)) : Date.now();
+  const end = new Date(anchor); end.setHours(0,0,0,0);
+  const buckets=[];
+  for(let i=days-1;i>=0;i--){
+    const d=new Date(end.getTime()-i*DAY);
+    buckets.push({ d, label:d.toLocaleDateString(undefined,{month:'short',day:'numeric'}), rev:0, units:0 });
+  }
+  const startMs = buckets[0].d.getTime();
+  sales.forEach(s=>{
+    const sd=new Date(s.ts); sd.setHours(0,0,0,0);
+    const idx=Math.round((sd.getTime()-startMs)/DAY);
+    if(idx>=0 && idx<days){ buckets[idx].rev+=s.total; buckets[idx].units+=s.items.reduce((a,i)=>a+i.qty,0); }
+  });
+  const hasData = buckets.some(b=>b.rev>0||b.units>0);
+  const revMax=Math.max(1,...buckets.map(b=>b.rev));
+  const uniMax=Math.max(1,...buckets.map(b=>b.units));
+  const W=760,H=280, pl=54,pr=22,pt=26,pb=42;
+  const pw=W-pl-pr, ph=H-pt-pb, n=buckets.length, slot=pw/n, bw=slot*0.5;
+  const yUni=v=>pt+ph-(v/uniMax)*ph;
+  const cx=i=>pl+slot*i+slot/2;
+  let grid='';
+  for(let g=0;g<=4;g++){
+    const gy=pt+ph-(ph*g/4), val=revMax*g/4;
+    grid+=`<line class="tc-grid" x1="${pl}" y1="${gy.toFixed(1)}" x2="${W-pr}" y2="${gy.toFixed(1)}"/>`;
+    grid+=`<text class="tc-axis" x="${pl-9}" y="${(gy+3.5).toFixed(1)}" text-anchor="end">${money(Math.round(val))}</text>`;
+  }
+  const bars=buckets.map((b,i)=>{
+    const h=(b.rev/revMax)*ph, x=cx(i)-bw/2, y=pt+ph-h;
+    return `<rect class="tc-bar" x="${x.toFixed(1)}" y="${y.toFixed(1)}" width="${bw.toFixed(1)}" height="${Math.max(0,h).toFixed(1)}" rx="3"><title>${b.label}: ${money(b.rev)} revenue</title></rect>`;
+  }).join('');
+  const pts=buckets.map((b,i)=>`${cx(i).toFixed(1)},${yUni(b.units).toFixed(1)}`).join(' ');
+  const line=`<polyline class="tc-line" points="${pts}" fill="none"/>`;
+  const dots=buckets.map((b,i)=>`<circle class="tc-dot" cx="${cx(i).toFixed(1)}" cy="${yUni(b.units).toFixed(1)}" r="3.6"><title>${b.label}: ${b.units} units</title></circle>`).join('');
+  const step=n>7?2:1;
+  const xl=buckets.map((b,i)=> (i%step===0)?`<text class="tc-axis" x="${cx(i).toFixed(1)}" y="${H-pb+18}" text-anchor="middle">${b.label}</text>`:'').join('');
+  const peak=`<text class="tc-axis" x="${W-pr}" y="${pt-10}" text-anchor="end">peak ${uniMax} units/day</text>`;
+  const svg=`<svg viewBox="0 0 ${W} ${H}" class="tc-svg" preserveAspectRatio="xMidYMid meet" role="img" aria-label="Revenue and units sold trend over the last ${days} days">${grid}${peak}${bars}${line}${dots}${xl}</svg>`;
+  return `<div class="panel trend-panel">
+    <div class="panel-head"><h4>Revenue &amp; Units Trend</h4>
+      <div class="tc-legend"><span class="lg lg-rev">Revenue</span><span class="lg lg-uni">Units sold</span></div>
+    </div>
+    <div class="panel-body">${hasData?svg:'<div class="empty">No sales in the last '+days+' days yet</div>'}</div>
+  </div>`;
+}
+
+// Horizontal bar breakdown of revenue grouped by product category,
+// computed live from sales (qty x price), with share percentages.
+function categoryBreakdown(){
+  const PAL=['#3658d6','#6f93f7','#12b76a','#f0b24a','#f0455b','#8b5cf6','#06b6d4','#64748b'];
+  const catRev={};
+  (DB.sales||[]).forEach(s=>s.items.forEach(it=>{
+    const p=DB.products.find(pr=>pr.id===it.id);
+    const cat=p? p.cat : 'Other';
+    catRev[cat]=(catRev[cat]||0)+it.qty*it.price;
+  }));
+  const rows=Object.entries(catRev).sort((a,b)=>b[1]-a[1]);
+  const total=rows.reduce((a,r)=>a+r[1],0);
+  const max=rows.length? rows[0][1] : 1;
+  const body = rows.length? rows.map((r,i)=>{
+    const pct = total? (r[1]/total*100) : 0;
+    const w = (r[1]/max*100);
+    const col = PAL[i%PAL.length];
+    return `<div class="cat-row"><div class="cat-name">${esc(r[0])}</div><div class="cat-track"><div class="cat-fill" style="width:${w.toFixed(1)}%;background:${col}"></div></div><div class="cat-val">${money(r[1])}<span class="cat-pct">${pct.toFixed(0)}%</span></div></div>`;
+  }).join('') : '<div class="empty">No sales yet</div>';
+  return `<div class="panel">
+    <div class="panel-head"><h4>Revenue by Category</h4>${rows.length?`<span class="cat-total">Total ${money(total)}</span>`:''}</div>
+    <div class="panel-body cat-body">${body}</div>
+  </div>`;
+}
+
+/* ============================================================
+   ADMIN — Inventory (full CRUD)
+   ============================================================ */
+let invSearch='';
+function viewInventory(c){
+  const q=invSearch.toLowerCase();
+  const rows = DB.products.filter(p=>!q || p.name.toLowerCase().includes(q) || p.sku.toLowerCase().includes(q) || p.cat.toLowerCase().includes(q));
+  c.innerHTML = `
+    <div class="panel">
+      <div class="panel-head">
+        <div class="toolbar" style="flex:1">
+          <div class="search"><span class="s-ico">🔍</span><input id="invSearch" placeholder="Search products, SKU, category…" value="${esc(invSearch)}"></div>
+        </div>
+        <button class="btn primary" id="addProd">+ Add Product</button>
+        <button class="btn ghost" id="bulkImport">⬆ Bulk Import</button>
+        <input type="file" id="csvFile" accept=".csv,text/csv" class="hidden">
+      </div>
+      <div class="tbl-wrap"><table><thead><tr><th>Product</th><th>Category</th><th>Price</th><th>Cost</th><th>Stock</th><th style="text-align:right">Actions</th></tr></thead><tbody>
+        ${rows.length? rows.map(p=>`<tr>
+          <td><div class="prod-cell"><div class="prod-thumb">${p.emoji}</div><div><div class="pname">${esc(p.name)}</div><div class="psku">${esc(p.sku)}</div></div></div></td>
+          <td>${esc(p.cat)}</td>
+          <td><b>${money(p.price)}</b></td>
+          <td style="color:var(--muted)">${money(p.cost)}</td>
+          <td>${stockBadge(p)}</td>
+          <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" data-edit="${p.id}">Edit</button> <button class="btn danger sm" data-del="${p.id}">Delete</button></td>
+        </tr>`).join('') : '<tr><td colspan="6"><div class="empty">No products match your search.</div></td></tr>'}
+      </tbody></table></div>
+    </div>`;
+  const si=$('#invSearch'); si.oninput=()=>{ invSearch=si.value; const p=si.selectionStart; viewInventory(c); const n=$('#invSearch'); n.focus(); n.setSelectionRange(p,p); };
+  $('#addProd').onclick=()=>productModal(null);
+  $('#bulkImport').onclick=()=>$('#csvFile').click();
+  $('#csvFile').onchange=e=>{ const f=e.target.files[0]; if(f) importCSV(f); e.target.value=''; };
+  c.querySelectorAll('[data-edit]').forEach(b=>b.onclick=()=>productModal(b.dataset.edit));
+  c.querySelectorAll('[data-del]').forEach(b=>b.onclick=()=>deleteProduct(b.dataset.del));
+}
+
+/* ---------- CSV bulk import ---------- */
+// minimal RFC-4180-ish parser (handles quotes, commas, newlines in quotes)
+function parseCSV(text){
+  text=text.replace(/^\uFEFF/,''); // strip BOM
+  const rows=[]; let row=[], field='', inQ=false;
+  for(let i=0;i<text.length;i++){
+    const ch=text[i];
+    if(inQ){
+      if(ch==='"'){ if(text[i+1]==='"'){ field+='"'; i++; } else inQ=false; }
+      else field+=ch;
+    } else {
+      if(ch==='"') inQ=true;
+      else if(ch===','){ row.push(field); field=''; }
+      else if(ch==='\n'){ row.push(field); rows.push(row); row=[]; field=''; }
+      else if(ch==='\r'){ /* skip */ }
+      else field+=ch;
+    }
+  }
+  if(field.length||row.length){ row.push(field); rows.push(row); }
+  return rows.filter(r=>r.some(c=>c.trim()!==''));
+}
+
+function importCSV(file){
+  const reader=new FileReader();
+  reader.onload=()=>{
+    let rows;
+    try{ rows=parseCSV(reader.result); }catch(e){ toast('Could not read that file'); return; }
+    if(rows.length<2){ toast('No data rows found in the CSV'); return; }
+    const header=rows[0].map(h=>h.trim().toLowerCase().replace(/\s+/g,'_'));
+    const col=names=>{ for(const n of names){ const i=header.indexOf(n); if(i>-1) return i; } return -1; };
+    const idx={
+      name:col(['name','product','product_name']),
+      sku:col(['sku','code']),
+      cat:col(['category','cat']),
+      emoji:col(['emoji','icon']),
+      price:col(['price','sell_price','selling_price']),
+      cost:col(['cost','unit_cost']),
+      stock:col(['stock','quantity','qty']),
+      reorder:col(['reorder_level','reorder','reorder_point'])
+    };
+    if(idx.name<0){ toast('CSV must have a "name" column'); return; }
+    const parsed=[]; const errors=[];
+    for(let r=1;r<rows.length;r++){
+      const cells=rows[r]; const g=i=>i>-1&&i<cells.length?cells[i].trim():'';
+      const name=g(idx.name);
+      if(!name){ errors.push('Row '+(r+1)+': missing name'); continue; }
+      parsed.push({
+        name,
+        sku:g(idx.sku)||'—',
+        cat:g(idx.cat)||'Uncategorized',
+        emoji:g(idx.emoji)||'👕',
+        price:parseFloat(g(idx.price))||0,
+        cost:parseFloat(g(idx.cost))||0,
+        stock:parseInt(g(idx.stock))||0,
+        reorder:parseInt(g(idx.reorder))||10
+      });
+    }
+    if(!parsed.length){ toast('No valid rows to import'); return; }
+    confirmImport(parsed, errors);
+  };
+  reader.onerror=()=>toast('Failed to read file');
+  reader.readAsText(file);
+}
+
+function confirmImport(parsed, errors){
+  // detect SKU matches against existing products (update vs add)
+  const bySku={}; DB.products.forEach(p=>{ if(p.sku&&p.sku!=='—') bySku[p.sku.toLowerCase()]=p; });
+  let updates=0, adds=0;
+  parsed.forEach(p=>{ if(bySku[p.sku.toLowerCase()]) updates++; else adds++; });
+  const preview=parsed.slice(0,8);
+  openModal('Confirm Bulk Import',`
+    <p style="margin-bottom:14px">Ready to import <b>${parsed.length}</b> product${parsed.length>1?'s':''} — <b>${adds}</b> new, <b>${updates}</b> updated (matched by SKU).</p>
+    ${errors.length?`<div class="login-err" style="text-align:left;margin-bottom:14px">${errors.length} row(s) skipped:<br>${errors.slice(0,5).map(esc).join('<br>')}${errors.length>5?'<br>…':''}</div>`:''}
+    <div class="tbl-wrap" style="border:1px solid var(--border);border-radius:8px;max-height:260px;overflow:auto">
+      <table><thead><tr><th>Product</th><th>SKU</th><th>Price</th><th>Stock</th></tr></thead><tbody>
+        ${preview.map(p=>`<tr><td>${p.emoji} ${esc(p.name)}</td><td>${esc(p.sku)}</td><td>${money(p.price)}</td><td>${p.stock}</td></tr>`).join('')}
+      </tbody></table>
+    </div>
+    ${parsed.length>8?`<p style="color:var(--muted);font-size:12px;margin-top:10px">…and ${parsed.length-8} more.</p>`:''}`,
+    [{label:'Cancel',cls:'ghost',act:closeModal},{label:'Import '+parsed.length+' product'+(parsed.length>1?'s':''),cls:'primary',act:()=>{
+      parsed.forEach(p=>{ const ex=bySku[p.sku.toLowerCase()]; if(ex) Object.assign(ex,p); else DB.products.push({id:'p'+Date.now()+Math.floor(Math.random()*9999),...p}); });
+      saveDB(); closeModal(); toast('Imported '+parsed.length+' product'+(parsed.length>1?'s':''));
+      renderView();
+    }}]);
+}
+
+function deleteProduct(id){
+  const p=DB.products.find(x=>x.id===id); if(!p) return;
+  openModal('Delete product',`<p>Delete <b>${esc(p.name)}</b> (${esc(p.sku)})? This cannot be undone.</p>`,
+    [{label:'Cancel',cls:'ghost',act:closeModal},{label:'Delete',cls:'danger',act:()=>{ DB.products=DB.products.filter(x=>x.id!==id); saveDB(); closeModal(); toast('Product deleted'); renderView(); }}]);
+}
+
+function productModal(id){
+  const p = id ? DB.products.find(x=>x.id===id) : {name:'',sku:'',cat:'',emoji:'👕',price:'',cost:'',stock:'',reorder:10};
+  openModal(id?'Edit Product':'Add Product',`
+    <div class="form-grid">
+      <div class="full"><label class="lbl">Product name</label><input class="inp" id="f_name" value="${esc(p.name)}"></div>
+      <div><label class="lbl">SKU</label><input class="inp" id="f_sku" value="${esc(p.sku)}"></div>
+      <div><label class="lbl">Category</label><input class="inp" id="f_cat" value="${esc(p.cat)}"></div>
+      <div><label class="lbl">Emoji / icon</label><input class="inp" id="f_emoji" value="${esc(p.emoji)}" maxlength="4"></div>
+      <div><label class="lbl">Reorder level</label><input class="inp" id="f_reorder" type="number" value="${p.reorder}"></div>
+      <div><label class="lbl">Sell price (MK)</label><input class="inp" id="f_price" type="number" step="0.01" value="${p.price}"></div>
+      <div><label class="lbl">Unit cost (MK)</label><input class="inp" id="f_cost" type="number" step="0.01" value="${p.cost}"></div>
+      <div class="full"><label class="lbl">Stock quantity</label><input class="inp" id="f_stock" type="number" value="${p.stock}"></div>
+    </div>`,
+    [{label:'Cancel',cls:'ghost',act:closeModal},{label:id?'Save changes':'Add product',cls:'primary',act:()=>{
+      const name=$('#f_name').value.trim(); if(!name){ toast('Name is required'); return; }
+      const data={ name, sku:$('#f_sku').value.trim()||'—', cat:$('#f_cat').value.trim()||'Uncategorized', emoji:$('#f_emoji').value.trim()||'👕', price:parseFloat($('#f_price').value)||0, cost:parseFloat($('#f_cost').value)||0, stock:parseInt($('#f_stock').value)||0, reorder:parseInt($('#f_reorder').value)||0 };
+      if(id){ Object.assign(p,data); toast('Product updated'); }
+      else { DB.products.push({id:'p'+Date.now(),...data}); toast('Product added'); }
+      saveDB(); closeModal(); renderView();
+    }}]);
+}
+
+/* ============================================================
+   ADMIN — Staff
+   ============================================================ */
+function viewStaff(c){
+  const staffStats = u => { const s=salesStats(u.id); return s; };
+  c.innerHTML=`
+    <div class="panel">
+      <div class="panel-head"><h4>Team Members</h4><button class="btn primary" id="addStaff">+ Add Staff</button></div>
+      <div class="tbl-wrap"><table><thead><tr><th>Name</th><th>Username</th><th>Role</th><th>Sales Made</th><th>Revenue</th><th style="text-align:right">Actions</th></tr></thead><tbody>
+        ${DB.users.map(u=>{ const s=staffStats(u); return `<tr>
+          <td><div class="prod-cell"><div class="prod-thumb">${u.name.split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase()}</div><div class="pname">${esc(u.name)}</div></div></td>
+          <td>${esc(u.username)}</td>
+          <td><span class="role-chip ${u.role}">${u.role==='admin'?'Admin':'Sales'}</span></td>
+          <td>${u.role==='admin'?'—':s.count}</td>
+          <td>${u.role==='admin'?'—':'<b>'+money(s.revenue)+'</b>'}</td>
+          <td style="text-align:right;white-space:nowrap"><button class="btn ghost sm" data-se="${u.id}">Edit</button> ${u.id===session.id?'':'<button class="btn danger sm" data-sd="'+u.id+'">Remove</button>'}</td>
+        </tr>`; }).join('')}
+      </tbody></table></div>
+    </div>`;
+  $('#addStaff').onclick=()=>staffModal(null);
+  c.querySelectorAll('[data-se]').forEach(b=>b.onclick=()=>staffModal(b.dataset.se));
+  c.querySelectorAll('[data-sd]').forEach(b=>b.onclick=()=>{
+    const u=DB.users.find(x=>x.id===b.dataset.sd);
+    openModal('Remove staff',`<p>Remove <b>${esc(u.name)}</b>? Their past sales records are kept.</p>`,
+     [{label:'Cancel',cls:'ghost',act:closeModal},{label:'Remove',cls:'danger',act:()=>{ DB.users=DB.users.filter(x=>x.id!==u.id); saveDB(); closeModal(); toast('Staff removed'); renderView(); }}]);
+  });
+}
+function staffModal(id){
+  const u = id ? DB.users.find(x=>x.id===id) : {name:'',username:'',password:'',role:'sales'};
+  openModal(id?'Edit Staff':'Add Staff',`
+    <div class="form-grid">
+      <div class="full"><label class="lbl">Full name</label><input class="inp" id="s_name" value="${esc(u.name)}"></div>
+      <div><label class="lbl">Username</label><input class="inp" id="s_user" value="${esc(u.username)}"></div>
+      <div><label class="lbl">Role</label><select class="inp" id="s_role"><option value="sales" ${u.role==='sales'?'selected':''}>Salesperson</option><option value="admin" ${u.role==='admin'?'selected':''}>Admin</option></select></div>
+      <div class="full"><label class="lbl">Password</label><input class="inp" id="s_pass" value="${esc(u.password||'')}" placeholder="Set a password"></div>
+    </div>`,
+    [{label:'Cancel',cls:'ghost',act:closeModal},{label:id?'Save changes':'Add staff',cls:'primary',act:()=>{
+      const name=$('#s_name').value.trim(), user=$('#s_user').value.trim();
+      if(!name||!user){ toast('Name and username are required'); return; }
+      if(DB.users.some(x=>x.username===user && x.id!==(id||''))){ toast('Username already taken'); return; }
+      const data={name,username:user,password:$('#s_pass').value||'changeme',role:$('#s_role').value};
+      if(id){ Object.assign(u,data); toast('Staff updated'); } else { DB.users.push({id:'u'+Date.now(),...data}); toast('Staff added'); }
+      saveDB(); closeModal(); renderView();
+    }}]);
+}
+
+/* ============================================================
+   ADMIN — Low-Stock Alerts
+   ============================================================ */
+function lowStockItems(){
+  return DB.products
+    .filter(p=>p.stock<=p.reorder)
+    .sort((a,b)=>(a.stock/ (a.reorder||1)) - (b.stock/(b.reorder||1)));
+}
+// Build a plain-text alert body (also used for the email)
+function buildAlertText(){
+  const items=lowStockItems();
+  const d=new Date().toLocaleString();
+  let t=`Low-Stock Alert — ${DB.settings.storeName}\nGenerated: ${d}\n\n`;
+  if(!items.length){ t+='All products are above their reorder levels. No action needed.'; return t; }
+  t+=`${items.length} product(s) need restocking:\n\n`;
+  items.forEach(p=>{
+    const status=p.stock<=0?'OUT OF STOCK':'LOW';
+    t+=`- ${p.name} (SKU ${p.sku}) — ${status}: ${p.stock} in stock, reorder level ${p.reorder}\n`;
+  });
+  t+=`\nSuggested action: reorder the items above.\n\n— Sent from ${DB.settings.storeName} inventory system`;
+  return t;
+}
+function buildMailto(){
+  const s=DB.settings;
+  const items=lowStockItems();
+  const subject=`[Low-Stock Alert] ${items.length} item(s) need restocking — ${s.storeName}`;
+  const params=[];
+  params.push('subject='+encodeURIComponent(subject));
+  params.push('body='+encodeURIComponent(buildAlertText()));
+  if(s.ccEmail) params.push('cc='+encodeURIComponent(s.ccEmail));
+  return 'mailto:'+encodeURIComponent(s.alertEmail)+'?'+params.join('&');
+}
+// One-click low-stock email: validate, then open a ready-to-send email.
+function sendLowStockAlert(){
+  const items=lowStockItems();
+  if(!items.length){ toast('🎉 Nothing is low on stock right now'); return; }
+  if(!DB.settings.alertEmail){ toast('Set a recipient email in Low-Stock Alerts first'); activeView='alerts'; renderApp(); return; }
+  toast('✉ Opening email for '+items.length+' low-stock item(s)…');
+  window.location.href=buildMailto();
+}
+
+function viewAlerts(c){
+  const s=DB.settings;
+  const items=lowStockItems();
+  const out=items.filter(p=>p.stock<=0).length, low=items.length-out;
+  c.innerHTML=`
+    <div class="settings-view">
+    <div class="kpi-grid">
+      <div class="kpi"><div class="k-ico">⚠️</div><div class="k-label">Needs Restock</div><div class="k-val">${items.length}</div><div class="k-sub">${low} low · ${out} out</div></div>
+      <div class="kpi"><div class="k-ico">📧</div><div class="k-label">Alert Recipient</div><div class="k-val" style="font-size:16px;word-break:break-all">${s.alertEmail?esc(s.alertEmail):'<span style="color:var(--muted)">Not set</span>'}</div><div class="k-sub">${s.autoAlertOnLogin?'Auto-check on login: ON':'Auto-check on login: OFF'}</div></div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h4>Notification Settings</h4></div>
+      <div class="panel-body">
+        <div class="form-grid">
+          <div><label class="lbl">Store name</label><input class="inp" id="a_store" value="${esc(s.storeName)}"></div>
+          <div><label class="lbl">Alert recipient email</label><input class="inp" id="a_email" type="email" placeholder="manager@store.com" value="${esc(s.alertEmail)}"></div>
+          <div><label class="lbl">CC (optional)</label><input class="inp" id="a_cc" type="email" placeholder="owner@store.com" value="${esc(s.ccEmail)}"></div>
+          <div><label class="lbl">Auto-check on admin login</label><select class="inp" id="a_auto"><option value="1" ${s.autoAlertOnLogin?'selected':''}>On — notify me at login</option><option value="0" ${!s.autoAlertOnLogin?'selected':''}>Off</option></select></div>
+        </div>
+        <div class="toolbar" style="margin-top:18px">
+          <button class="btn primary" id="a_save">Save Settings</button>
+          <button class="btn ghost" id="a_send" ${items.length&&s.alertEmail?'':'disabled style="opacity:.5;cursor:not-allowed"'}>✉ Send Alert Email Now</button>
+          <button class="btn ghost" id="a_copy">📋 Copy Alert Text</button>
+        </div>
+        <p style="font-size:12px;color:var(--muted);margin-top:12px;line-height:1.6">
+          “Send Alert Email” opens your email app with a ready-to-send message (recipient, subject and the full low-stock list pre-filled) — you just press send. This works entirely offline with no server.<br>
+          For fully automatic, scheduled emails (sent without anyone logging in) a small backend mail service is required — see the note I’ll give you.
+        </p>
+      </div>
+    </div>
+
+    <div class="panel">
+      <div class="panel-head"><h4>Items Needing Restock</h4><button class="btn ghost sm" id="a_inv">Go to Inventory</button></div>
+      <div class="tbl-wrap"><table><thead><tr><th>Product</th><th>Category</th><th>In Stock</th><th>Reorder Level</th><th>Status</th></tr></thead><tbody>
+        ${items.length?items.map(p=>`<tr>
+          <td><div class="prod-cell"><div class="prod-thumb">${p.emoji}</div><div><div class="pname">${esc(p.name)}</div><div class="psku">${esc(p.sku)}</div></div></div></td>
+          <td>${esc(p.cat)}</td><td><b>${p.stock}</b></td><td style="color:var(--muted)">${p.reorder}</td><td>${stockBadge(p)}</td>
+        </tr>`).join(''):'<tr><td colspan="5"><div class="empty">🎉 Everything is well stocked — no alerts right now.</div></td></tr>'}
+      </tbody></table></div>
+    </div>
+    </div>`;
+
+  $('#a_save').onclick=()=>{
+    s.storeName=$('#a_store').value.trim()||'Elliana The Shop';
+    s.alertEmail=$('#a_email').value.trim();
+    s.ccEmail=$('#a_cc').value.trim();
+    s.autoAlertOnLogin=$('#a_auto').value==='1';
+    saveDB(); toast('Settings saved'); viewAlerts(c);
+  };
+  const sendBtn=$('#a_send');
+  if(sendBtn && !sendBtn.disabled) sendBtn.onclick=sendLowStockAlert;
+  $('#a_copy').onclick=()=>{
+    const txt=buildAlertText();
+    if(navigator.clipboard&&navigator.clipboard.writeText){ navigator.clipboard.writeText(txt).then(()=>toast('Alert text copied'),()=>fallbackCopy(txt)); }
+    else fallbackCopy(txt);
+  };
+  $('#a_inv').onclick=()=>{ activeView='inventory'; renderApp(); };
+}
+function fallbackCopy(txt){
+  const ta=document.createElement('textarea'); ta.value=txt; ta.style.position='fixed'; ta.style.opacity='0'; document.body.appendChild(ta); ta.select();
+  try{ document.execCommand('copy'); toast('Alert text copied'); }catch(e){ toast('Copy not supported — select manually'); }
+  document.body.removeChild(ta);
+}
+
+/* Auto-check: when an admin logs in, flag low stock */
+function maybeAutoAlert(){
+  if(session.role!=='admin' || !DB.settings.autoAlertOnLogin) return;
+  const n=lowStockItems().length;
+  if(n>0) setTimeout(()=>toast('⚠️ '+n+' product(s) are low or out of stock — check Low-Stock Alerts'),600);
+}
+
+/* ============================================================
+   ADMIN — Reports
+   ============================================================ */
+function viewReports(c){
+  // revenue by category
+  const catMap={};
+  DB.sales.forEach(s=>s.items.forEach(i=>{ const p=DB.products.find(x=>x.id===i.id); const cat=p?p.cat:'Other'; catMap[cat]=(catMap[cat]||0)+i.qty*i.price; }));
+  const cats=Object.entries(catMap).sort((a,b)=>b[1]-a[1]); const maxCat=cats.length?cats[0][1]:1;
+  // staff leaderboard
+  const board=DB.users.filter(u=>u.role==='sales').map(u=>({name:u.name,...salesStats(u.id)})).sort((a,b)=>b.revenue-a.revenue);
+  const maxRev=board.length?Math.max(...board.map(b=>b.revenue),1):1;
+  const grossProfit=DB.sales.reduce((a,s)=>a+s.items.reduce((b,i)=>{ const p=DB.products.find(x=>x.id===i.id); return b+(i.price-(p?p.cost:0))*i.qty; },0),0);
+  const st=salesStats();
+  c.innerHTML=`
+    <div class="kpi-grid">
+      <div class="kpi"><div class="k-ico">💵</div><div class="k-label">Gross Profit</div><div class="k-val">${money(grossProfit)}</div><div class="k-sub">Across all sales</div></div>
+      <div class="kpi"><div class="k-ico">🧾</div><div class="k-label">Transactions</div><div class="k-val">${st.count}</div><div class="k-sub">Avg ${money(st.avg)}</div></div>
+      <div class="kpi"><div class="k-ico">📉</div><div class="k-label">Margin</div><div class="k-val">${st.revenue?Math.round(grossProfit/st.revenue*100):0}%</div><div class="k-sub">Profit / revenue</div></div>
+    </div>
+    <div class="two-col">
+      <div class="panel"><div class="panel-head"><h4>Revenue by Category</h4></div><div class="panel-body">
+        ${cats.length?cats.map(x=>`<div class="bar-row"><div class="bl">${esc(x[0])}</div><div class="bar-track"><div class="bar-fill" style="width:${x[1]/maxCat*100}%"></div></div><div class="bv">${money(x[1])}</div></div>`).join(''):'<div class="empty">No sales yet</div>'}
+      </div></div>
+      <div class="panel"><div class="panel-head"><h4>Salesperson Leaderboard</h4></div><div class="panel-body">
+        ${board.length?board.map(b=>`<div class="bar-row"><div class="bl">${esc(b.name)}</div><div class="bar-track"><div class="bar-fill" style="width:${b.revenue/maxRev*100}%;background:var(--green)"></div></div><div class="bv">${money(b.revenue)}</div></div>`).join(''):'<div class="empty">No staff</div>'}
+      </div></div>
+    </div>`;
+}
+
+/* ============================================================
+   SALES HISTORY  (admin = all / sales = own)
+   ============================================================ */
+function viewSalesHistory(c, mine){
+  const list=[...DB.sales].filter(s=>!mine||s.cashier===session.id).sort((a,b)=>b.ts-a.ts);
+  const total=list.reduce((a,s)=>a+s.total,0);
+  c.innerHTML=`
+    <div class="kpi-grid">
+      <div class="kpi"><div class="k-ico">🧾</div><div class="k-label">${mine?'My Sales':'Total Sales'}</div><div class="k-val">${list.length}</div></div>
+      <div class="kpi"><div class="k-ico">💰</div><div class="k-label">${mine?'My Revenue':'Total Revenue'}</div><div class="k-val">${money(total)}</div></div>
+    </div>
+    <div class="panel">
+      <div class="panel-head"><h4>${mine?'My Transactions':'All Transactions'}</h4></div>
+      <div class="tbl-wrap"><table><thead><tr><th>Receipt</th>${mine?'':'<th>Cashier</th>'}<th>Items</th><th>Total</th><th>Date</th><th style="text-align:right">Receipt</th></tr></thead><tbody>
+        ${list.length?list.map(s=>`<tr>
+          <td><b>#${s.id}</b></td>${mine?'':`<td>${esc(s.cashierName)}</td>`}
+          <td>${s.items.map(i=>esc(i.name)+' ×'+i.qty).join(', ')}</td>
+          <td><b>${money(s.total)}</b></td>
+          <td style="color:var(--muted)">${fmtDate(s.ts)}</td>
+          <td style="text-align:right"><button class="btn ghost sm" data-rc="${s.id}">View</button></td>
+        </tr>`).join(''):`<tr><td colspan="${mine?5:6}"><div class="empty">No sales recorded yet.</div></td></tr>`}
+      </tbody></table></div>
+    </div>`;
+  c.querySelectorAll('[data-rc]').forEach(b=>b.onclick=()=>showReceipt(b.dataset.rc));
+}
+function showReceipt(id){
+  const s=DB.sales.find(x=>x.id===id); if(!s) return;
+  openModal('Receipt #'+s.id,`
+    <p style="color:var(--muted);font-size:13px;margin-bottom:14px">${esc(s.cashierName)} · ${fmtDate(s.ts)}</p>
+    <table><thead><tr><th>Item</th><th>Qty</th><th>Price</th><th style="text-align:right">Line</th></tr></thead><tbody>
+      ${s.items.map(i=>`<tr><td>${esc(i.name)}</td><td>${i.qty}</td><td>${money(i.price)}</td><td style="text-align:right">${money(i.price*i.qty)}</td></tr>`).join('')}
+    </tbody></table>
+    <div class="cart-total grand"><span>Total</span><span>${money(s.total)}</span></div>`,
+    [{label:'Close',cls:'primary',act:closeModal}]);
+}
+
+/* ============================================================
+   SALESPERSON — POS (New Sale)
+   ============================================================ */
+let posSearch='';
+let posScanFocus=false, scanStream=null, scanRAF=null;
+// Match a scanned/typed code against product SKU (or optional barcode field)
+function findByCode(code){
+  if(!code) return null;
+  const c=code.trim().toLowerCase();
+  const norm=x=>String(x||'').toLowerCase().replace(/[-\s]/g,'');
+  return DB.products.find(p=> (p.sku&&p.sku.toLowerCase()===c) || (p.barcode&&String(p.barcode).toLowerCase()===c))
+      || DB.products.find(p=> norm(p.sku)===norm(c) || (p.barcode&&norm(p.barcode)===norm(c)));
+}
+// Quick-add a product to the cart from a scanned/typed code
+function scanAdd(code,c){
+  const p=findByCode(code);
+  if(!p){ toast('✗ No product matches “'+code+'”'); return false; }
+  if(p.stock<=0){ toast(p.name+' is out of stock'); return false; }
+  const cur=cart[p.id]||0;
+  if(cur>=p.stock){ toast('Only '+p.stock+' of '+p.name+' in stock'); return false; }
+  cart[p.id]=cur+1; toast('✓ Added '+p.name+' ('+p.sku+')'); viewPOS(c); return true;
+}
+// Optional camera scanning via the native BarcodeDetector API (where available)
+async function openScanner(c){
+  if(!('BarcodeDetector' in window)){ toast('Camera scan not supported here — use a handheld scanner or type the SKU'); const sc=$('#posScan'); if(sc) sc.focus(); return; }
+  openModal('📷 Scan a barcode','<div class="scanview"><video id="scanVid" playsinline muted></video><div class="scanline"></div></div><p id="scanMsg" style="color:var(--muted);font-size:13px;margin-top:12px;text-align:center">Point the camera at a product barcode…</p>',[{label:'Cancel',cls:'ghost',act:closeModal}]);
+  try{
+    const detector=new BarcodeDetector({formats:['ean_13','ean_8','code_128','code_39','upc_a','upc_e','itf','qr_code']});
+    scanStream=await navigator.mediaDevices.getUserMedia({video:{facingMode:'environment'}});
+    const vid=$('#scanVid'); if(!vid){ closeModal(); return; }
+    vid.srcObject=scanStream; await vid.play();
+    const tick=async()=>{
+      if(!scanStream) return;
+      try{
+        const codes=await detector.detect(vid);
+        if(codes&&codes.length){
+          const raw=codes[0].rawValue;
+          if(findByCode(raw)){ closeModal(); posScanFocus=true; scanAdd(raw,c); return; }
+          const m=$('#scanMsg'); if(m) m.textContent='Unknown code: '+raw+' — no matching product';
+        }
+      }catch(e){}
+      scanRAF=requestAnimationFrame(tick);
+    };
+    scanRAF=requestAnimationFrame(tick);
+  }catch(err){ const m=$('#scanMsg'); if(m) m.textContent='Camera unavailable: '+((err&&err.message)||'permission denied'); }
+}
+function viewPOS(c){
+  const q=posSearch.toLowerCase();
+  const prods=DB.products.filter(p=>!q||p.name.toLowerCase().includes(q)||p.cat.toLowerCase().includes(q));
+  const cartItems=Object.entries(cart).map(([id,qty])=>({p:DB.products.find(x=>x.id===id),qty})).filter(x=>x.p);
+  const subtotal=cartItems.reduce((a,x)=>a+x.p.price*x.qty,0);
+  const tax=subtotal*0.08, grand=subtotal+tax;
+  c.innerHTML=`
+    <div class="pos-grid">
+      <div>
+        <div class="scanbar"><span class="s-ico">📷</span><input id="posScan" placeholder="Scan or type a barcode / SKU, then press Enter…" autocomplete="off"><button class="btn ghost sm" id="posCam" type="button">📷 Camera</button></div>
+        <div class="search" style="max-width:none;margin-bottom:16px"><span class="s-ico">🔍</span><input id="posSearch" placeholder="Search products to add…" value="${esc(posSearch)}"></div>
+        <div class="pos-products">
+          ${prods.map(p=>`<button class="pcard" data-add="${p.id}" ${p.stock<=0?'disabled':''}>
+            <div class="pc-emoji">${p.emoji}</div>
+            <div class="pc-name">${esc(p.name)}</div>
+            <div class="pc-meta">${esc(p.cat)} · ${p.stock<=0?'<span style="color:var(--red)">Out</span>':p.stock+' left'}</div>
+            <div class="pc-price">${money(p.price)}</div>
+          </button>`).join('')}
+        </div>
+      </div>
+      <div class="panel cart">
+        <div class="panel-head"><h4>🛒 Current Sale</h4>${cartItems.length?'<button class="btn ghost sm" id="clearCart">Clear</button>':''}</div>
+        <div class="panel-body">
+          ${cartItems.length? cartItems.map(x=>`<div class="cart-item">
+            <div style="font-size:22px">${x.p.emoji}</div>
+            <div style="flex:1"><div class="ci-name">${esc(x.p.name)}</div><div class="ci-sub">${money(x.p.price)} each</div></div>
+            <div class="qty"><button data-dec="${x.p.id}">−</button><span>${x.qty}</span><button data-inc="${x.p.id}">+</button></div>
+          </div>`).join('') : '<div class="empty">Tap a product to start a sale.</div>'}
+          ${cartItems.length?`
+          <div style="margin-top:16px">
+            <div class="cart-total"><span style="color:var(--muted)">Subtotal</span><span>${money(subtotal)}</span></div>
+            <div class="cart-total"><span style="color:var(--muted)">Tax (8%)</span><span>${money(tax)}</span></div>
+            <div class="cart-total grand"><span>Total</span><span>${money(grand)}</span></div>
+            <button class="btn primary" id="checkout" style="width:100%;justify-content:center;margin-top:14px;padding:12px">Complete Sale · ${money(grand)}</button>
+          </div>`:''}
+        </div>
+      </div>
+    </div>`;
+  const si=$('#posSearch'); si.oninput=()=>{ posSearch=si.value; const pos=si.selectionStart; viewPOS(c); const n=$('#posSearch'); n.focus(); n.setSelectionRange(pos,pos); };
+  const scan=$('#posScan');
+  if(scan){ scan.onkeydown=e=>{ if(e.key==='Enter'){ e.preventDefault(); const v=scan.value.trim(); scan.value=''; if(v){ posScanFocus=true; scanAdd(v,c); } } }; }
+  const cam=$('#posCam'); if(cam) cam.onclick=()=>openScanner(c);
+  if(posScanFocus){ const sc=$('#posScan'); if(sc) sc.focus(); posScanFocus=false; }
+  c.querySelectorAll('[data-add]').forEach(b=>b.onclick=()=>addToCart(b.dataset.add,c));
+  c.querySelectorAll('[data-inc]').forEach(b=>b.onclick=()=>addToCart(b.dataset.inc,c));
+  c.querySelectorAll('[data-dec]').forEach(b=>b.onclick=()=>{ const id=b.dataset.dec; cart[id]--; if(cart[id]<=0) delete cart[id]; viewPOS(c); });
+  const cc=$('#clearCart'); if(cc) cc.onclick=()=>{ cart={}; viewPOS(c); };
+  const co=$('#checkout'); if(co) co.onclick=()=>checkout(c);
+}
+function addToCart(id,c){
+  const p=DB.products.find(x=>x.id===id); if(!p||p.stock<=0) return;
+  const cur=cart[id]||0; if(cur>=p.stock){ toast('Only '+p.stock+' in stock'); return; }
+  cart[id]=cur+1; viewPOS(c);
+}
+function checkout(c){
+  const items=Object.entries(cart).map(([id,qty])=>{ const p=DB.products.find(x=>x.id===id); return {id,name:p.name,qty,price:p.price}; });
+  if(!items.length) return;
+  const subtotal=items.reduce((a,i)=>a+i.price*i.qty,0); const total=subtotal*1.08;
+  // decrement stock
+  items.forEach(i=>{ const p=DB.products.find(x=>x.id===i.id); if(p) p.stock=Math.max(0,p.stock-i.qty); });
+  const sale={id:(DB.nextSale++).toString(),ts:Date.now(),cashier:session.id,cashierName:session.name,items,total:Math.round(total*100)/100};
+  DB.sales.push(sale); saveDB(); cart={};
+  closeModal(); toast('Sale #'+sale.id+' completed · '+money(sale.total));
+  showReceipt(sale.id);
+  viewPOS(c);
+}
+
+/* ============================================================
+   SALESPERSON — Catalog (read-only)
+   ============================================================ */
+let catSearch='';
+function viewCatalog(c){
+  const q=catSearch.toLowerCase();
+  const rows=DB.products.filter(p=>!q||p.name.toLowerCase().includes(q)||p.sku.toLowerCase().includes(q)||p.cat.toLowerCase().includes(q));
+  c.innerHTML=`
+    <div class="panel">
+      <div class="panel-head"><div class="search"><span class="s-ico">🔍</span><input id="catSearch" placeholder="Search catalog…" value="${esc(catSearch)}"></div></div>
+      <div class="tbl-wrap"><table><thead><tr><th>Product</th><th>Category</th><th>Price</th><th>Availability</th></tr></thead><tbody>
+        ${rows.map(p=>`<tr>
+          <td><div class="prod-cell"><div class="prod-thumb">${p.emoji}</div><div><div class="pname">${esc(p.name)}</div><div class="psku">${esc(p.sku)}</div></div></div></td>
+          <td>${esc(p.cat)}</td><td><b>${money(p.price)}</b></td><td>${stockBadge(p)}</td>
+        </tr>`).join('')}
+      </tbody></table></div>
+    </div>`;
+  const si=$('#catSearch'); si.oninput=()=>{ catSearch=si.value; const p=si.selectionStart; viewCatalog(c); const n=$('#catSearch'); n.focus(); n.setSelectionRange(p,p); };
+}
+
+/* ============================================================
+   MODAL + INIT
+   ============================================================ */
+function openModal(title, bodyHTML, buttons){
+  const m=$('#modal');
+  m.innerHTML=`<div class="modal">
+    <div class="modal-head"><h4>${esc(title)}</h4><button class="x" id="mClose">×</button></div>
+    <div class="modal-body">${bodyHTML}</div>
+    <div class="modal-foot" id="mFoot"></div>
+  </div>`;
+  const foot=$('#mFoot');
+  (buttons||[]).forEach(b=>{ const btn=document.createElement('button'); btn.className='btn '+b.cls; btn.textContent=b.label; btn.onclick=b.act; foot.appendChild(btn); });
+  $('#mClose').onclick=closeModal;
+  m.classList.add('show');
+  m.onclick=e=>{ if(e.target===m) closeModal(); };
+}
+function closeModal(){ if(scanRAF){ cancelAnimationFrame(scanRAF); scanRAF=null; } if(scanStream){ scanStream.getTracks().forEach(t=>t.stop()); scanStream=null; } const m=$('#modal'); m.classList.remove('show'); m.innerHTML=''; }
+
+/* boot */
+function restoreSession(){
+  let sid=null;
+  try{ sid=sessionStorage.getItem(SESSION_KEY); }catch(e){}
+  if(!sid) sid=ssGet(SESSION_KEY);
+  const user = sid ? DB.users.find(x=>x.id===sid) : null;
+  if(user){
+    session = user;
+    activeView = user.role==='admin' ? 'dashboard' : 'pos';
+    renderApp();
+    maybeAutoAlert();
+  } else {
+    clearSession();
+    renderLogin();
+  }
+}
+
+/* Apply a dataset pushed from another device, keeping this user signed in. */
+function applyCloudState(data){
+  if(!data) return;
+  cloudApplying = true;
+  DB = data;
+  if(!DB.settings) DB.settings = { alertEmail:'', ccEmail:'', storeName:'Elliana The Shop', autoAlertOnLogin:true };
+  try{ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }catch(e){}
+  if(session){
+    const me = DB.users.find(x=>x.id===session.id);
+    if(me){ session = me; renderApp(); }
+    else { session=null; clearSession(); renderLogin(); toast('Your account was changed \u2014 please sign in again'); }
+  } else {
+    renderLogin();
+  }
+  cloudApplying = false;
+}
+
+(async function boot(){
+  loadDB(); /* show local data instantly */
+  if(window.Cloud && Cloud.ready){
+    try{
+      const remote = await Cloud.loadState();
+      if(remote){
+        DB = remote;
+        if(!DB.settings) DB.settings = { alertEmail:'', ccEmail:'', storeName:'Elliana The Shop', autoAlertOnLogin:true };
+        try{ localStorage.setItem(DB_KEY, JSON.stringify(DB)); }catch(e){}
+      } else {
+        Cloud.saveState(DB); /* first run: seed the cloud from local defaults */
+      }
+      Cloud.subscribe(applyCloudState);
+    }catch(e){ console.warn('Cloud load failed \u2014 using local data', e); }
+  }
+  restoreSession();
+})();
+</script>
+<script>
+/* Register the service worker for offline app support (HTTPS or localhost only). */
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', function () {
+    navigator.serviceWorker.register('sw.js').catch(function (e) {
+      console.warn('[PWA] service worker registration failed', e);
+    });
+  });
+}
+</script>
+</body>
+</html>
